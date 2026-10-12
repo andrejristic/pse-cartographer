@@ -1,0 +1,13 @@
+# PSE Cartographer — base (GUI + L0/L1 + cloud spokespersons). CPU, no GPU.
+# The shared pse_a engine is imported from the sibling "PSE J-space/app" folder
+# (see cartographer/engine_path.py); it brings its own numpy/gguf needs.
+numpy>=1.24
+gguf>=0.9
+PySide6>=6.5
+matplotlib>=3.7
+anthropic>=0.40          # Claude spokesperson (official SDK)
+openai>=1.40             # Gemini / Mistral / Groq spokespersons (OpenAI-compatible)
+
+# Dissection (L2-L4 / cartography) is installed on demand from the Patient tab:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install transformers accelerate sentencepiece protobuf

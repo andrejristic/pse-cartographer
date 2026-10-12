@@ -1,0 +1,26 @@
+[project]
+name = "pse-cartographer"
+version = "0.1.0"
+description = "PSE Cartographer — live J-space cartography of a local GGUF patient, on the PSE-A engine"
+authors = [{ name = "Andrej Ristic", email = "andrej.s.ristic@gmail.com" }]
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.24",
+    "gguf>=0.9",
+    "PySide6>=6.5",
+    "matplotlib>=3.7",
+    "anthropic>=0.40",   # Claude spokesperson
+    "openai>=1.40",      # Gemini / Mistral / Groq spokespersons (OpenAI-compatible)
+]
+
+[project.optional-dependencies]
+# dissection of the patient (L2-L4 / cartography); a CUDA GPU helps L4 a lot
+dissect = ["torch>=2.1", "transformers>=4.44", "accelerate>=0.30", "sentencepiece", "protobuf"]
+
+[project.scripts]
+pse-cartographer = "main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
