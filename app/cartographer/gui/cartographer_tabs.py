@@ -120,10 +120,19 @@ class CartographerWidget(QWidget):
         self._bundle = bundle
         seal = ("sealed into the dossier" if bundle.get("sealed")
                 else f"measured but not sealed — {bundle.get('refused', '')}")
+        self.main.mission_finished("J-space cartography", bundle)   # refreshes every panel
         self.status.setText(f"Done: {len(bundle['readouts'])} prompts, {len(bundle['layers_mapped'])} "
                             f"layers; {seal}.")
+        # show THIS run, not whatever the refreshed run picker selected
+        self.picker.box.blockSignals(True)
+        i = self.picker.box.findData(bundle.get("run_id"))
+        if i >= 0:
+            self.picker.box.setCurrentIndex(i)
+        else:
+            self.picker.box.insertItem(0, "this session (not sealed)", "")
+            self.picker.box.setCurrentIndex(0)
+        self.picker.box.blockSignals(False)
         self._render_all(bundle)
-        self.main.mission_finished("J-space cartography", bundle)
         self.tabs.setCurrentIndex(3)                      # jump to Drift / Diff — the heart
 
     def _load_run(self, run_id):
