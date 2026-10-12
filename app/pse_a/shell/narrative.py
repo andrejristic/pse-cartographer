@@ -154,6 +154,11 @@ def cartography(m: dict, h: str) -> list[str]:
     else:
         out.append(f"No sharp commitment was seen for these prompts {_c(h)}.")
     out.append(f"By the concepts they light up, the prompts form {s.get('n_clusters', 0)} group(s) {_c(h)}.")
+    rs = s.get("routing")
+    if rs:
+        out.append(f"This model routes each token to {rs['experts_per_token']} of {rs['n_experts']} "
+                   f"experts; the experts chosen change by {rs['mean_routing_drift']:.2f} on average "
+                   f"between prompts {_c(h)}.")
     return out
 
 

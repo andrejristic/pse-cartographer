@@ -79,6 +79,17 @@ class Reporter:
                    f"{s.get('ignition_detected_fraction', 0) * 100:.0f}% of prompts; "
                    if ign else "no sharp commitment ('ignition') was detected; ")
                 + f"the prompts fell into {s.get('n_clusters', 0)} J-space group(s).")
+            rs = s.get("routing")
+            if rs:
+                corr = rs.get("drift_correlation")
+                parts.append(
+                    f"Expert routing (mixture of experts, {rs['experts_per_token']} of "
+                    f"{rs['n_experts']} experts per token): the experts chosen for the last token "
+                    f"change by {rs['mean_routing_drift']:.2f} on average between prompts (peak "
+                    f"{rs['max_routing_drift']:.2f}); about {rs['experts_used_mean']:.0f} distinct "
+                    f"experts per layer carried these prompts"
+                    + (f"; routing drift and concept drift correlate at {corr:.2f}." if corr is not None
+                       else "."))
         return "\n".join(parts)
 
     @staticmethod

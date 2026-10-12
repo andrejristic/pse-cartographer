@@ -43,6 +43,8 @@ def check_vjp_fd(path, tol: float = 1e-6) -> list[str]:
         U = rng.standard_normal((3, rt.d))
         layers = list(range(rt.n_layers))
         g = rt.vjp_multi(ids, layers, U, position=-1, normed=True)
+        if rt.spec.n_expert:                  # FD must not cross a routing switch
+            rt.force_routing = rt.route(ids)
         for L in layers:
             _, acts = rt.run_resid(ids, hook_points={f"resid_pre.{L}"})
             h0 = acts[f"resid_pre.{L}"].copy()

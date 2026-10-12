@@ -1,6 +1,6 @@
 # PSE Cartographer — Guide (English)
 
-Version 0.2.0. Ordered from **most important to least important**. Read as far as you need and stop.
+Version 0.4.0. Ordered from **most important to least important**. Read as far as you need and stop.
 
 ---
 
@@ -56,6 +56,11 @@ cartographer. "Defer" works, and you can choose later (**Cartographer → Choose
    probe words. **Report** = the plain-language report + a short expert note.
 5. Every finished run is in the run picker at the top, so you can reopen it later.
 
+**Experts** (mixture-of-experts models only): the second map next to J-space. At every layer the
+router sends each token to a few experts out of many; this tab shows which experts carry a prompt
+(heatmap: layer × expert), how much the chosen experts change from prompt to prompt (routing drift,
+drawn next to the concept drift), and which concepts the model holds when a given expert is chosen.
+
 **Active cartographer** (checkbox): the spokesperson invents the next prompt from the previous
 readout — the working model steers the mapping instead of a fixed list.
 
@@ -110,9 +115,9 @@ nothing is marked as unreliable. The report is sealed like every other result an
 
 ## 7. Install
 
-- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.2.0_amd64.deb`, then start
+- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.4.0_amd64.deb`, then start
   *PSE Cartographer* from the menu or run `pse-cartographer`.
-- **Windows (.exe)**: run `PSECartographer-Setup-0.2.0.exe` (no admin rights needed).
+- **Windows (.exe)**: run `PSECartographer-Setup-0.4.0.exe` (no admin rights needed).
 - **From source**: `cd app && ./setup.sh && ./run.sh` (Python 3.10+).
 
 Check an installation at any time: `pse-cartographer --selftest` (no network, no models).
@@ -121,8 +126,11 @@ Check an installation at any time: `pse-cartographer --selftest` (no network, no
 
 ## 8. Supported models and limits
 
-- Architectures: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral** (and other models that
-  llama.cpp writes as `llama`). Others are refused when the file is opened, never mid-run.
+- Architectures: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral, Gemma / Gemma 2 / Gemma 3,
+  Phi-2, Phi-3 / 3.5, StableLM 2, OLMo 2, Granite 3** (and other models llama.cpp writes as
+  `llama`, e.g. SmolLM2, Falcon 3, TinyLlama), and the mixture-of-experts models **Granite 3 MoE**
+  (1B-A400M, 3B-A800M) and **OLMoE**.
+  Others are refused when the file is opened, never mid-run.
 - Quantizations: F32, F16, BF16, Q8_0, Q4_0/Q4_1, Q5_0/Q5_1, Q2_K–Q6_K, IQ4_NL.
 - Machine: a 16 GB computer without a GPU (even without AVX2) maps **0.5–3B** models comfortably
   (minutes for 0.5B, ~10 minutes for 1B, longer for 3B). Bigger models still work when they don't

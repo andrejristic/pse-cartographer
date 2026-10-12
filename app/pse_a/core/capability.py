@@ -100,6 +100,11 @@ def semaphore(g: GGUFFile, mm: ModelMap, rates: MachineRates, ram_bytes: int,
                        f"layers are dequantized one at a time (works, ~{STREAM_SLOWDOWN:.0f}x slower)")
     n_nonembed = n_params - g.tensors["token_embd.weight"].n_elements - (
         g.tensors["output.weight"].n_elements if "output.weight" in g.tensors else 0)
+    if spec.n_expert:            # MoE: each token passes through only k of E experts
+        exp = sum(g.tensors[n].n_elements for n in g.tensors if "_exps." in n)
+        n_nonembed -= int(exp * (1 - spec.n_expert_used / spec.n_expert))
+        c.notes.append(f"mixture of experts: {spec.n_expert_used} of {spec.n_expert} experts per "
+                       f"token; expert routing is mapped too")
     js = jspace_seconds(n_nonembed, n_prompts, n_probes, seq_len, rates, c.streaming)
     c.estimates[f"J-space cartography ({n_prompts} prompts, {n_probes} probes, all layers)"] = human(js)
     return c

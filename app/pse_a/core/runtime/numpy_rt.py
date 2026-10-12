@@ -36,7 +36,6 @@ from .arch import ROPE_NEOX, ArchSpec, spec_from_gguf
 from .tokenizer import GGUFTokenizer
 
 F = np.float32
-_BLOCK_MATS = ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down")
 
 
 @dataclass
@@ -92,18 +91,39 @@ def rms_bwd(dy: np.ndarray, x: np.ndarray, r: np.ndarray, w: np.ndarray | None):
     return r * g - x * (r ** 3) * (g * x).mean(-1, keepdims=True)
 
 
-def rope_tables(spec: ArchSpec, n_pos: int, freq_factors: np.ndarray | None, start: int = 0):
+def layer_norm(x, w, b, eps):
+    mu = x.mean(-1, keepdims=True)
+    xc = x - mu
+    r = 1.0 / np.sqrt((xc * xc).mean(-1, keepdims=True) + eps)
+    xh = xc * r
+    y = xh * w if w is not None else xh
+    return (y + b if b is not None else y), (xh, r)
+
+
+def layer_norm_bwd(dy, cache, w):
+    xh, r = cache
+    g = dy * w if w is not None else dy
+    return r * (g - g.mean(-1, keepdims=True) - xh * (g * xh).mean(-1, keepdims=True))
+
+
+def rope_tables(spec: ArchSpec, n_pos: int, freq_factors: np.ndarray | None, start: int = 0,
+                base: float | None = None, linear: float = 1.0):
     rd = spec.rope_dim
-    inv = 1.0 / (spec.rope_base ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
+    base = spec.rope_base if base is None else base
+    inv = 1.0 / (base ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
     if freq_factors is not None:
         inv = inv / freq_factors.astype(np.float64)[: inv.shape[0]]
-    ang = np.arange(start, start + n_pos, dtype=np.float64)[:, None] * inv[None, :]
-    return np.cos(ang).astype(F), np.sin(ang).astype(F)          # (T, rd/2)
+    pos = np.arange(start, start + n_pos, dtype=np.float64) / linear
+    ang = pos[:, None] * inv[None, :]
+    m = spec.rope_attn_factor
+    return (np.cos(ang) * m).astype(F), (np.sin(ang) * m).astype(F)          # (T, rd/2)
 
 
 def rope_apply(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, kind: str, rd: int,
                inverse: bool = False) -> np.ndarray:
-    """x (..., T, hd). Rotacija je ortogonalna, pa je VJP ista rotacija sa -sin."""
+    """x (..., T, hd); rotira prvih rd dimenzija. Bez faktora paznje (attn_factor = 1)
+    rotacija je ortogonalna, pa je VJP ista rotacija sa -sin; sa faktorom m je VJP
+    transponovana matrica: cos·m i -sin·m -- isti izraz."""
     s = -sin if inverse else sin
     out = x.copy()
     if kind == ROPE_NEOX:
@@ -126,6 +146,21 @@ def softmax(z: np.ndarray, axis: int = -1) -> np.ndarray:
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 0.5 * (1.0 + np.tanh(0.5 * x))
+
+
+_GC = np.float32(np.sqrt(2.0 / np.pi))
+
+
+def act_fwd(kind: str, g: np.ndarray):
+    """(a, izvod) -- izvod se cuva za backward."""
+    if kind == "silu":
+        sg = sigmoid(g)
+        return g * sg, sg * (1.0 + g * (1.0 - sg))
+    u = _GC * (g + 0.044715 * g ** 3)                 # gelu, tanh aproksimacija
+    t = np.tanh(u)
+    a = 0.5 * g * (1.0 + t)
+    da = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * _GC * (1.0 + 3 * 0.044715 * g * g)
+    return a, da
 
 
 def mm(x: np.ndarray, W: np.ndarray) -> np.ndarray:
@@ -153,13 +188,18 @@ class NumpyRuntime:
         self.caps = Capabilities(max_memory=ram, resident=bool(resident))
 
         T = lambda name: np.ascontiguousarray(dq.tensor(self.g, name), dtype=F)
+        opt = lambda name: T(name) if name in self.g.tensors else None
         self.embed = T("token_embd.weight")                         # (vocab, d)
         self.W_U = self.embed if sp.tied else T("output.weight")
+        self.out_bias = opt("output.bias")
         self.final_norm_w = T("output_norm.weight")
-        self.freq_factors = T("rope_freqs.weight") if sp.has_rope_freqs else None
+        self.final_norm_b = opt("output_norm.bias")
+        self.freq_factors = T(sp.rope_factors) if sp.rope_factors else None
         self._cache: OrderedDict[int, dict] = OrderedDict()
         self._cache_max = self.n_layers if resident else 2
-        self.scale = F(1.0 / np.sqrt(sp.head_dim))     # np.float64 bi tiho promovisao sve u fp64
+        self.scale = F(sp.scale())                     # np.float64 bi tiho promovisao sve u fp64
+        self.routing = None                            # {sloj: (idx, w)} kad se trazi (MoE)
+        self.force_routing = None                      # {sloj: (idx, _)}: zamrznuto rutiranje (testovi)
 
     # -------------------------------------------------------------- tezine
     def block(self, L: int) -> dict:
@@ -167,17 +207,46 @@ class NumpyRuntime:
         if b is not None:
             self._cache.move_to_end(L)
             return b
+        sp = self.spec
         p = f"blk.{L}."
+        names = self.g.tensors
         T = lambda name: np.ascontiguousarray(dq.tensor(self.g, p + name), dtype=F)
-        b = {k: T(k + ".weight") for k in _BLOCK_MATS}
-        b["attn_norm"] = T("attn_norm.weight")
-        b["ffn_norm"] = T("ffn_norm.weight")
-        if self.spec.qkv_bias:
+        opt = lambda name: T(name) if p + name in names else None
+        b = {}
+        if sp.fused_qkv:
+            qkv, bias = T("attn_qkv.weight"), opt("attn_qkv.bias")
+            nq, nk = sp.n_head * sp.head_dim, sp.n_kv * sp.head_dim
+            b["attn_q"], b["attn_k"], b["attn_v"] = qkv[:nq], qkv[nq:nq + nk], qkv[nq + nk:]
+            b["attn_q_b"] = b["attn_k_b"] = b["attn_v_b"] = None
+            if bias is not None:
+                b["attn_q_b"], b["attn_k_b"], b["attn_v_b"] = bias[:nq], bias[nq:nq + nk], bias[nq + nk:]
+        else:
             for k in ("attn_q", "attn_k", "attn_v"):
-                b[k + "_b"] = T(k + ".bias")
-        if self.spec.qk_norm:
-            b["q_norm"] = T("attn_q_norm.weight")
-            b["k_norm"] = T("attn_k_norm.weight")
+                b[k] = T(k + ".weight")
+                b[k + "_b"] = opt(k + ".bias")
+        b["attn_output"], b["attn_output_b"] = T("attn_output.weight"), opt("attn_output.bias")
+        if sp.n_expert:
+            b["router"] = T("ffn_gate_inp.weight")                          # (E, d)
+            b["exp_gate"] = T("ffn_gate_exps.weight")                       # (E, ff, d)
+            b["exp_up"] = T("ffn_up_exps.weight")
+            b["exp_down"] = T("ffn_down_exps.weight")                       # (E, d, ff)
+            if sp.shared_expert:
+                for k in ("gate", "up", "down"):
+                    b[f"sh_{k}"] = T(f"ffn_{k}_shexp.weight")
+        elif sp.fused_gate_up:
+            gu = T("ffn_up.weight")
+            b["ffn_gate"], b["ffn_up"] = gu[:sp.d_ff], gu[sp.d_ff:]
+            b["ffn_gate_b"] = b["ffn_up_b"] = None
+        else:
+            b["ffn_up"], b["ffn_up_b"] = T("ffn_up.weight"), opt("ffn_up.bias")
+            if sp.mlp == "gated":
+                b["ffn_gate"], b["ffn_gate_b"] = T("ffn_gate.weight"), opt("ffn_gate.bias")
+        if not sp.n_expert:
+            b["ffn_down"], b["ffn_down_b"] = T("ffn_down.weight"), opt("ffn_down.bias")
+        for k in ("attn_norm", "ffn_norm", "post_attention_norm", "post_ffw_norm"):
+            b[k], b[k + "_b"] = opt(k + ".weight"), opt(k + ".bias")
+        if sp.qk_norm:
+            b["q_norm"], b["k_norm"] = T("attn_q_norm.weight"), T("attn_k_norm.weight")
         self._cache[L] = b
         while len(self._cache) > self._cache_max:
             self._cache.popitem(last=False)
@@ -193,42 +262,76 @@ class NumpyRuntime:
     def token_str(self, i: int) -> str:
         return self.tok.decode([int(i)])
 
+    # -------------------------------------------------------------- norme
+    def _norm(self, x, w, b):
+        if self.spec.norm == "layer":
+            return layer_norm(x, w, b, self.spec.norm_eps)
+        return rms(x, w, self.spec.norm_eps)
+
+    def _norm_bwd(self, dy, x, cache, w):
+        if self.spec.norm == "layer":
+            return layer_norm_bwd(dy, cache, w)
+        return rms_bwd(dy, x, cache, w)
+
     def final_norm(self, h: np.ndarray) -> np.ndarray:
-        return rms(h, self.final_norm_w, self.spec.norm_eps)[0]
+        return self._norm(h, self.final_norm_w, self.final_norm_b)[0]
+
+    def unembed(self, z: np.ndarray) -> np.ndarray:
+        """Normirano stanje -> logiti, sa svim zavrsnim transformacijama modela."""
+        sp = self.spec
+        lg = z @ self.W_U.T
+        if self.out_bias is not None:
+            lg = lg + self.out_bias
+        if sp.logit_scale != 1.0:
+            lg = lg / F(sp.logit_scale)
+        if sp.final_softcap:
+            lg = F(sp.final_softcap) * np.tanh(lg / F(sp.final_softcap))
+        return lg
 
     # -------------------------------------------------------------- blok
-    def _rope(self, T: int, start: int = 0):
-        return rope_tables(self.spec, T, self.freq_factors, start)
+    def _ropes(self, T: int, start: int = 0) -> dict:
+        """{sloj: (cos, sin)} -- tabele se dele medju slojevima iste baze/faktora."""
+        tabs, out = {}, {}
+        for L in range(self.n_layers):
+            key = self.spec.layer_rope(L)
+            if key not in tabs:
+                tabs[key] = rope_tables(self.spec, T, self.freq_factors, start, *key)
+            out[L] = tabs[key]
+        return out
 
-    def _mask(self, T: int, S: int) -> np.ndarray:
+    def _mask(self, T: int, S: int, window: int | None) -> np.ndarray:
         """Kauzalna (i sliding-window) maska za T novih upita nad S kljuceva."""
         q = np.arange(S - T, S)[:, None]
         k = np.arange(S)[None, :]
         bad = k > q
-        if self.spec.sliding_window:
-            bad |= k <= q - self.spec.sliding_window
+        if window:
+            bad |= k <= q - window
         return np.where(bad, -np.inf, 0.0).astype(F)
 
-    def _block_fwd(self, x: np.ndarray, b: dict, cos, sin, keep: bool, kv=None):
+    @staticmethod
+    def _lin(x, W, bias):
+        y = x @ W.T if x.ndim == 2 else mm(x, W.T)
+        return y + bias if bias is not None else y
+
+    def _attn_fwd(self, h, b, L, cos, sin, keep, kv):
         sp = self.spec
-        T = x.shape[0]
+        T = h.shape[0]
         H, KV, hd, rd = sp.n_head, sp.n_kv, sp.head_dim, sp.rope_dim
-        h1, r1 = rms(x, b["attn_norm"], sp.norm_eps)
-        q = h1 @ b["attn_q"].T
-        k = h1 @ b["attn_k"].T
-        v = h1 @ b["attn_v"].T
-        if sp.qkv_bias:
-            q = q + b["attn_q_b"]
-            k = k + b["attn_k_b"]
-            v = v + b["attn_v_b"]
+        q = self._lin(h, b["attn_q"], b["attn_q_b"])
+        k = self._lin(h, b["attn_k"], b["attn_k_b"])
+        v = self._lin(h, b["attn_v"], b["attn_v_b"])
+        c = {}
+        if sp.qk_norm == "full":
+            c["qf"], c["kf"] = q, k
+            q, c["rqf"] = rms(q, b["q_norm"], sp.norm_eps)
+            k, c["rkf"] = rms(k, b["k_norm"], sp.norm_eps)
         q = q.reshape(T, H, hd).transpose(1, 0, 2)                  # (H, T, hd)
         k = k.reshape(T, KV, hd).transpose(1, 0, 2)
         v = v.reshape(T, KV, hd).transpose(1, 0, 2)
-        qn = kn = rq = rk = None
-        if sp.qk_norm:
-            qn, kn = q, k
-            q, rq = rms(q, b["q_norm"], sp.norm_eps)
-            k, rk = rms(k, b["k_norm"], sp.norm_eps)
+        if sp.qk_norm == "head":
+            c["qn"], c["kn"] = q, k
+            q, c["rq"] = rms(q, b["q_norm"], sp.norm_eps)
+            k, c["rk"] = rms(k, b["k_norm"], sp.norm_eps)
         q = rope_apply(q, cos, sin, sp.rope, rd)
         k = rope_apply(k, cos, sin, sp.rope, rd)
         if kv is not None:                                          # generisanje
@@ -239,40 +342,33 @@ class NumpyRuntime:
         S = k.shape[1]
         kk = np.repeat(k, sp.gqa_group, axis=0)                     # (H, S, hd)
         vv = np.repeat(v, sp.gqa_group, axis=0)
-        A = softmax(q @ kk.transpose(0, 2, 1) * self.scale + self._mask(T, S))
+        z = q @ kk.transpose(0, 2, 1) * self.scale
+        if sp.attn_softcap:
+            cap = F(sp.attn_softcap)
+            tz = np.tanh(z / cap)
+            z = cap * tz
+            c["tz"] = tz
+        A = softmax(z + self._mask(T, S, sp.layer_window(L)))
         o = (A @ vv).transpose(1, 0, 2).reshape(T, H * hd)
-        x2 = x + o @ b["attn_output"].T
-        h2, r2 = rms(x2, b["ffn_norm"], sp.norm_eps)
-        gt = h2 @ b["ffn_gate"].T
-        up = h2 @ b["ffn_up"].T
-        sg = sigmoid(gt)
-        x3 = x2 + (gt * sg * up) @ b["ffn_down"].T
-        if not keep:
-            return x3, None
-        return x3, dict(x=x, r1=r1, q=q, kk=kk, vv=vv, A=A, qn=qn, kn=kn, rq=rq, rk=rk,
-                        x2=x2, r2=r2, gt=gt, sg=sg, up=up)
+        out = self._lin(o, b["attn_output"], b["attn_output_b"])
+        if keep:
+            c.update(q=q, kk=kk, vv=vv, A=A)
+        return out, c
 
-    def _block_bwd(self, dx3: np.ndarray, b: dict, c: dict, cos, sin) -> np.ndarray:
-        """dx3 (P, T, d) -> dx (P, T, d). Samo po rezidualnom toku."""
+    def _attn_bwd(self, dout, b, c, cos, sin):
+        """dout (P, T, d) -> dh (P, T, d), po ulazu paznje."""
         sp = self.spec
-        P, T, _ = dx3.shape
+        P, T, _ = dout.shape
         H, KV, hd, rd, grp = sp.n_head, sp.n_kv, sp.head_dim, sp.rope_dim, sp.gqa_group
-        # --- MLP: x3 = x2 + (silu(g)·u) Wd^T
-        da = mm(dx3, b["ffn_down"])                                    # (P, T, ff)
-        gt, sg, up = c["gt"], c["sg"], c["up"]
-        du = da * (gt * sg)
-        dg = da * up * (sg * (1.0 + gt * (1.0 - sg)))
-        dh2 = mm(dg, b["ffn_gate"]) + mm(du, b["ffn_up"])
-        del da, du, dg
-        dx2 = dx3 + rms_bwd(dh2, c["x2"], c["r2"], b["ffn_norm"])
-        del dh2
-        # --- paznja: x2 = x + o Wo^T
-        do = mm(dx2, b["attn_output"]).reshape(P, T, H, hd).transpose(0, 2, 1, 3)  # (P,H,T,hd)
+        do = mm(dout, b["attn_output"]).reshape(P, T, H, hd).transpose(0, 2, 1, 3)  # (P,H,T,hd)
         A, kk, vv, q = c["A"], c["kk"], c["vv"], c["q"]
         dA = do @ vv.transpose(0, 2, 1)[None]                       # (P, H, T, S)
         dvv = np.einsum("hts,phtd->phsd", A, do, optimize=True)
-        dS = A[None] * (dA - (dA * A[None]).sum(-1, keepdims=True)) * self.scale
+        dS = A[None] * (dA - (dA * A[None]).sum(-1, keepdims=True))
         del dA, do
+        if sp.attn_softcap:
+            dS = dS * (1.0 - c["tz"] ** 2)[None]
+        dS *= self.scale
         dq = dS @ kk[None]                                          # (P, H, T, hd)
         dkk = np.einsum("phts,htd->phsd", dS, q, optimize=True)
         del dS
@@ -281,38 +377,193 @@ class NumpyRuntime:
         del dkk, dvv
         dq = rope_apply(dq, cos, sin, sp.rope, rd, inverse=True)
         dk = rope_apply(dk, cos, sin, sp.rope, rd, inverse=True)
-        if sp.qk_norm:
+        if sp.qk_norm == "head":
             dq = rms_bwd(dq, c["qn"], c["rq"], b["q_norm"])
             dk = rms_bwd(dk, c["kn"], c["rk"], b["k_norm"])
         dq = dq.transpose(0, 2, 1, 3).reshape(P, T, H * hd)
         dk = dk.transpose(0, 2, 1, 3).reshape(P, T, KV * hd)
         dv = dv.transpose(0, 2, 1, 3).reshape(P, T, KV * hd)
-        dh1 = mm(dq, b["attn_q"]) + mm(dk, b["attn_k"]) + mm(dv, b["attn_v"])
-        return dx2 + rms_bwd(dh1, c["x"], c["r1"], b["attn_norm"])
+        if sp.qk_norm == "full":
+            dq = rms_bwd(dq, c["qf"], c["rqf"], b["q_norm"])
+            dk = rms_bwd(dk, c["kf"], c["rkf"], b["k_norm"])
+        return mm(dq, b["attn_q"]) + mm(dk, b["attn_k"]) + mm(dv, b["attn_v"])
+
+    # -------------------------------------------------------------- MoE
+    def _moe_fwd(self, h, b, keep, L):
+        """Router (softmax nad svim ekspertima -> top-k [-> ponovo normirano]) + eksperti.
+
+        Zapisuje rutiranje (koji ekspert, s kojom tezinom, za svaki token) u
+        self.routing[L] -- to je mapa rutiranja koju Cartographer prikazuje."""
+        sp = self.spec
+        T = h.shape[0]
+        k = sp.n_expert_used
+        p = softmax((h @ b["router"].T).astype(np.float64)).astype(F)    # (T, E)
+        if self.force_routing is not None:        # test hook: same experts as a base pass
+            idx = self.force_routing[L][0]
+        else:
+            idx = np.argsort(-p, axis=-1, kind="stable")[:, :k]            # (T, k)
+        wr = np.take_along_axis(p, idx, axis=-1)
+        S = wr.sum(-1, keepdims=True)
+        w = wr / S if sp.expert_norm else wr
+        if self.routing is not None:
+            self.routing[L] = (idx.copy(), w.copy())
+        out = np.zeros((T, h.shape[1]), dtype=F)
+        experts = {}
+        for e in np.unique(idx):
+            t, slot = np.nonzero(idx == e)
+            ht = h[t]
+            gt = ht @ b["exp_gate"][e].T
+            up = ht @ b["exp_up"][e].T
+            a, da = act_fwd(sp.act, gt)
+            y = (a * up) @ b["exp_down"][e].T                                # (n, d)
+            out[t] += w[t, slot][:, None] * y
+            if keep:
+                experts[int(e)] = (t, slot, a, da, up, y)
+        sh = None
+        if sp.shared_expert:
+            gt = h @ b["sh_gate"].T
+            up = h @ b["sh_up"].T
+            a, da = act_fwd(sp.act, gt)
+            out = out + (a * up) @ b["sh_down"].T
+            sh = (a, da, up)
+        return out, (dict(p=p, idx=idx, w=w, S=S, experts=experts, sh=sh) if keep else None)
+
+    def _moe_bwd(self, dout, b, c):
+        sp = self.spec
+        P, T, d = dout.shape
+        dh = np.zeros((P, T, d), dtype=F)
+        dw = np.zeros((P, T, sp.n_expert_used), dtype=F)
+        w = c["w"]
+        for e, (t, slot, a, da, up, y) in c["experts"].items():
+            g = dout[:, t, :]                                              # (P, n, d)
+            dw[:, t, slot] = (g * y[None]).sum(-1)
+            dm = mm(g * w[t, slot][None, :, None], b["exp_down"][e])       # (P, n, ff)
+            dh[:, t, :] += mm(dm * up * da, b["exp_gate"][e]) + mm(dm * a, b["exp_up"][e])
+        if sp.expert_norm:
+            dw = (dw - (dw * w[None]).sum(-1, keepdims=True)) / c["S"][None]
+        p = c["p"]
+        dp = np.zeros((P, T, p.shape[1]), dtype=F)
+        np.put_along_axis(dp, np.broadcast_to(c["idx"][None], dw.shape), dw, axis=-1)
+        dlog = p[None] * (dp - (dp * p[None]).sum(-1, keepdims=True))
+        dh += mm(dlog, b["router"])
+        if c["sh"] is not None:
+            a, da, up = c["sh"]
+            dm = mm(dout, b["sh_down"])
+            dh += mm(dm * up * da, b["sh_gate"]) + mm(dm * a, b["sh_up"])
+        return dh
+
+    def _mlp_fwd(self, h, b, keep, L=0):
+        sp = self.spec
+        if sp.n_expert:
+            return self._moe_fwd(h, b, keep, L)
+        if sp.mlp == "gated":
+            gt = self._lin(h, b["ffn_gate"], b["ffn_gate_b"])
+            up = self._lin(h, b["ffn_up"], b["ffn_up_b"])
+            a, da = act_fwd(sp.act, gt)
+            out = self._lin(a * up, b["ffn_down"], b["ffn_down_b"])
+            return out, (dict(da=da, a=a, up=up) if keep else None)
+        up = self._lin(h, b["ffn_up"], b["ffn_up_b"])
+        a, da = act_fwd(sp.act, up)
+        out = self._lin(a, b["ffn_down"], b["ffn_down_b"])
+        return out, (dict(da=da) if keep else None)
+
+    def _mlp_bwd(self, dout, b, c):
+        if self.spec.n_expert:
+            return self._moe_bwd(dout, b, c)
+        dm = mm(dout, b["ffn_down"])                                 # (P, T, ff)
+        if self.spec.mlp == "gated":
+            dg = dm * c["up"] * c["da"]
+            du = dm * c["a"]
+            return mm(dg, b["ffn_gate"]) + mm(du, b["ffn_up"])
+        return mm(dm * c["da"], b["ffn_up"])
+
+    def _block_fwd(self, x: np.ndarray, b: dict, L: int, cos, sin, keep: bool, kv=None):
+        sp = self.spec
+        rs = F(sp.residual_scale)
+        c = {"x": x}
+        h1 = x
+        if sp.norm_pre:
+            h1, c["n1"] = self._norm(x, b["attn_norm"], b["attn_norm_b"])
+        att, c["att"] = self._attn_fwd(h1, b, L, cos, sin, keep, kv)
+        if sp.norm_post:
+            c["att_raw"] = att
+            att, c["pn1"] = self._norm(att, b["post_attention_norm"], b["post_attention_norm_b"])
+        if sp.parallel:
+            mo, c["mlp"] = self._mlp_fwd(h1, b, keep, L)
+            x3 = x + rs * att + rs * mo
+        else:
+            x2 = x + rs * att
+            c["x2"] = x2
+            h2 = x2
+            if sp.norm_pre:
+                h2, c["n2"] = self._norm(x2, b["ffn_norm"], b["ffn_norm_b"])
+            mo, c["mlp"] = self._mlp_fwd(h2, b, keep, L)
+            if sp.norm_post:
+                c["mlp_raw"] = mo
+                mo, c["pn2"] = self._norm(mo, b["post_ffw_norm"], b["post_ffw_norm_b"])
+            x3 = x2 + rs * mo
+        return x3, (c if keep else None)
+
+    def _block_bwd(self, dx3: np.ndarray, b: dict, c: dict, cos, sin) -> np.ndarray:
+        """dx3 (P, T, d) -> dx (P, T, d). Samo po rezidualnom toku."""
+        sp = self.spec
+        rs = F(sp.residual_scale)
+        if sp.parallel:
+            dh1 = self._mlp_bwd(dx3 * rs, b, c["mlp"])
+            datt = dx3 * rs
+            if sp.norm_post:
+                datt = self._norm_bwd(datt, c["att_raw"], c["pn1"], b["post_attention_norm"])
+            dh1 = dh1 + self._attn_bwd(datt, b, c["att"], cos, sin)
+            return dx3 + self._norm_bwd(dh1, c["x"], c["n1"], b["attn_norm"])
+        dmo = dx3 * rs
+        if sp.norm_post:
+            dmo = self._norm_bwd(dmo, c["mlp_raw"], c["pn2"], b["post_ffw_norm"])
+        dh2 = self._mlp_bwd(dmo, b, c["mlp"])
+        dx2 = dx3 + (self._norm_bwd(dh2, c["x2"], c["n2"], b["ffn_norm"]) if sp.norm_pre else dh2)
+        del dh2, dmo
+        datt = dx2 * rs
+        if sp.norm_post:
+            datt = self._norm_bwd(datt, c["att_raw"], c["pn1"], b["post_attention_norm"])
+        dh1 = self._attn_bwd(datt, b, c["att"], cos, sin)
+        return dx2 + (self._norm_bwd(dh1, c["x"], c["n1"], b["attn_norm"]) if sp.norm_pre else dh1)
 
     # -------------------------------------------------------------- [SPEC] Sec 2
+    def _embed(self, ids) -> np.ndarray:
+        x = self.embed[np.asarray(ids, dtype=np.int64)].astype(F)
+        return x * F(self.spec.embed_scale) if self.spec.embed_scale != 1.0 else x
+
     def run_resid(self, ids, start_layer: int = 0, x=None, stop_layer: int | None = None,
                   hook_points=None):
         """Rezidualni tok: resid_pre.L je ULAZ u blok L. Vraca (x_final, acts)."""
-        ids = np.asarray(ids, dtype=np.int64)
         if x is None:
-            x = self.embed[ids].astype(F)
-        cos, sin = self._rope(x.shape[0])
+            x = self._embed(ids)
+        ropes = self._ropes(x.shape[0])
         stop = self.n_layers if stop_layer is None else stop_layer
         acts = {}
         for L in range(start_layer, stop):
             if hook_points is None or f"resid_pre.{L}" in hook_points:
                 acts[f"resid_pre.{L}"] = x
-            x, _ = self._block_fwd(x, self.block(L), cos, sin, keep=False)
+            x, _ = self._block_fwd(x, self.block(L), L, *ropes[L], keep=False)
         acts["resid_final"] = x
         return x, acts
+
+    def route(self, tokens) -> dict:
+        """MoE: {sloj: (izabrani eksperti (T,k), tezine (T,k))} za jedan prompt; {} za gust model."""
+        if not self.spec.n_expert:
+            return {}
+        self.routing = {}
+        try:
+            self.run_resid(tokens)
+            return self.routing
+        finally:
+            self.routing = None
 
     def forward_with_hooks(self, tokens, hook_points=None) -> dict:
         return self.run_resid(tokens, hook_points=hook_points)[1]
 
     def logits(self, tokens) -> np.ndarray:
         x, _ = self.run_resid(tokens)
-        return self.final_norm(x) @ self.W_U.T
+        return self.unembed(self.final_norm(x))
 
     def vjp_multi(self, tokens, layers, cotangents, position: int = -1,
                   normed: bool = True, chunk: int = 64) -> dict:
@@ -321,16 +572,15 @@ class NumpyRuntime:
         [SPEC] Sec 7: pun Jakobijan se nikad ne materijalizuje. Kotangente se
         obradjuju u komadima od `chunk` da memorija ostane ogranicena.
         """
-        ids = np.asarray(tokens, dtype=np.int64)
         layers = sorted(set(int(L) for L in layers))
         lo = layers[0]
-        Tn = ids.shape[0]
+        x = self._embed(tokens)
+        Tn = x.shape[0]
         pos = position % Tn
-        cos, sin = self._rope(Tn)
-        x = self.embed[ids].astype(F)
+        ropes = self._ropes(Tn)
         caches = {}
         for L in range(self.n_layers):
-            x, c = self._block_fwd(x, self.block(L), cos, sin, keep=L >= lo)
+            x, c = self._block_fwd(x, self.block(L), L, *ropes[L], keep=L >= lo)
             if c is not None:
                 caches[L] = c
         U = np.asarray(cotangents, dtype=F)
@@ -340,12 +590,12 @@ class NumpyRuntime:
             dx = np.zeros((Uc.shape[0], Tn, self.d), dtype=F)
             if normed:
                 xf = x[pos]
-                _, r = rms(xf, self.final_norm_w, self.spec.norm_eps)
-                dx[:, pos, :] = rms_bwd(Uc, xf, r, self.final_norm_w)
+                _, cache = self._norm(xf, self.final_norm_w, self.final_norm_b)
+                dx[:, pos, :] = self._norm_bwd(Uc, xf, cache, self.final_norm_w)
             else:
                 dx[:, pos, :] = Uc
             for L in range(self.n_layers - 1, lo - 1, -1):
-                dx = self._block_bwd(dx, self.block(L), caches[L], cos, sin)
+                dx = self._block_bwd(dx, self.block(L), caches[L], *ropes[L])
                 if L in out:
                     out[L].append(dx)
         return {L: np.concatenate(v, axis=0) for L, v in out.items()}
@@ -362,13 +612,13 @@ class NumpyRuntime:
         kvs = [dict(k=None, v=None) for _ in range(self.n_layers)]
         pos, cur = 0, list(ids)
         for _ in range(max_new):
-            x = self.embed[np.asarray(cur, dtype=np.int64)].astype(F)
+            x = self._embed(cur)
             T = x.shape[0]
-            cos, sin = self._rope(T, start=pos)
+            ropes = self._ropes(T, start=pos)
             for L in range(self.n_layers):
-                x, _ = self._block_fwd(x, self.block(L), cos, sin, keep=False, kv=kvs[L])
+                x, _ = self._block_fwd(x, self.block(L), L, *ropes[L], keep=False, kv=kvs[L])
             pos += T
-            lg = (self.final_norm(x[-1]) @ self.W_U.T).astype(np.float64)
+            lg = self.unembed(self.final_norm(x[-1])).astype(np.float64)
             if temperature <= 0:
                 nxt = int(lg.argmax())
             else:
@@ -385,10 +635,3 @@ class NumpyRuntime:
 
     def chat_ids(self, system: str, turns: list) -> list[int]:
         return self.tok.chat_ids(system, turns)
-
-
-def threads_hint() -> None:
-    """Fizicka jezgra za BLAS, ako korisnik nije sam postavio (doctor upozorava)."""
-    if "OMP_NUM_THREADS" not in os.environ:
-        n = os.cpu_count() or 1
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max(1, n)))

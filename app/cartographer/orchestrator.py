@@ -32,6 +32,7 @@ from pse_a.shell.shared_lib import SealRefused, Welford
 from pse_a.shell.unit import Budget, Unit
 
 from . import drift as drift_mod
+from . import routing as routing_mod
 from .basis import estimate_bases
 from .report import Reporter
 from .session import CartographySession
@@ -150,6 +151,8 @@ class Orchestrator:
                 vals[f"{family}/cartography/ignition_depth"] = r.ignition_layer / max(rt.n_layers - 1, 1)
             if prev is not None:
                 vals[f"{family}/cartography/drift"] = drift_mod.drift([prev, r])[0]
+                if r.routing and prev.routing:
+                    vals[f"{family}/cartography/routing_drift"] = routing_mod.routing_drift([prev, r])[0]
             for key, v in vals.items():
                 if not math.isfinite(v):
                     continue
@@ -180,6 +183,9 @@ class Orchestrator:
 
         # --- drift + report (C7 + C9) ---
         summ = drift_mod.summary(sess.readouts)
+        rsum = routing_mod.summary(sess.readouts)
+        if rsum:
+            summ["routing"] = rsum
         bundle = {
             "model": {"display_name": name, "architecture": mm.architecture,
                       "n_layers": mm.n_layers, "model_hash": mh, "path": gguf_path},
