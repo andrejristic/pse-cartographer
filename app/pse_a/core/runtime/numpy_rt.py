@@ -198,6 +198,8 @@ class NumpyRuntime:
         self._cache: OrderedDict[int, dict] = OrderedDict()
         self._cache_max = self.n_layers if resident else 2
         self.scale = F(sp.scale())                     # np.float64 bi tiho promovisao sve u fp64
+        self.routing = None                            # {sloj: (idx, w)} kad se trazi (MoE)
+        self.force_routing = None                      # {sloj: (idx, _)}: zamrznuto rutiranje (testovi)
 
     # -------------------------------------------------------------- tezine
     def block(self, L: int) -> dict:
@@ -223,7 +225,15 @@ class NumpyRuntime:
                 b[k] = T(k + ".weight")
                 b[k + "_b"] = opt(k + ".bias")
         b["attn_output"], b["attn_output_b"] = T("attn_output.weight"), opt("attn_output.bias")
-        if sp.fused_gate_up:
+        if sp.n_expert:
+            b["router"] = T("ffn_gate_inp.weight")                          # (E, d)
+            b["exp_gate"] = T("ffn_gate_exps.weight")                       # (E, ff, d)
+            b["exp_up"] = T("ffn_up_exps.weight")
+            b["exp_down"] = T("ffn_down_exps.weight")                       # (E, d, ff)
+            if sp.shared_expert:
+                for k in ("gate", "up", "down"):
+                    b[f"sh_{k}"] = T(f"ffn_{k}_shexp.weight")
+        elif sp.fused_gate_up:
             gu = T("ffn_up.weight")
             b["ffn_gate"], b["ffn_up"] = gu[:sp.d_ff], gu[sp.d_ff:]
             b["ffn_gate_b"] = b["ffn_up_b"] = None
@@ -231,7 +241,8 @@ class NumpyRuntime:
             b["ffn_up"], b["ffn_up_b"] = T("ffn_up.weight"), opt("ffn_up.bias")
             if sp.mlp == "gated":
                 b["ffn_gate"], b["ffn_gate_b"] = T("ffn_gate.weight"), opt("ffn_gate.bias")
-        b["ffn_down"], b["ffn_down_b"] = T("ffn_down.weight"), opt("ffn_down.bias")
+        if not sp.n_expert:
+            b["ffn_down"], b["ffn_down_b"] = T("ffn_down.weight"), opt("ffn_down.bias")
         for k in ("attn_norm", "ffn_norm", "post_attention_norm", "post_ffw_norm"):
             b[k], b[k + "_b"] = opt(k + ".weight"), opt(k + ".bias")
         if sp.qk_norm:
@@ -377,8 +388,74 @@ class NumpyRuntime:
             dk = rms_bwd(dk, c["kf"], c["rkf"], b["k_norm"])
         return mm(dq, b["attn_q"]) + mm(dk, b["attn_k"]) + mm(dv, b["attn_v"])
 
-    def _mlp_fwd(self, h, b, keep):
+    # -------------------------------------------------------------- MoE
+    def _moe_fwd(self, h, b, keep, L):
+        """Router (softmax nad svim ekspertima -> top-k [-> ponovo normirano]) + eksperti.
+
+        Zapisuje rutiranje (koji ekspert, s kojom tezinom, za svaki token) u
+        self.routing[L] -- to je mapa rutiranja koju Cartographer prikazuje."""
         sp = self.spec
+        T = h.shape[0]
+        k = sp.n_expert_used
+        p = softmax((h @ b["router"].T).astype(np.float64)).astype(F)    # (T, E)
+        if self.force_routing is not None:        # test hook: same experts as a base pass
+            idx = self.force_routing[L][0]
+        else:
+            idx = np.argsort(-p, axis=-1, kind="stable")[:, :k]            # (T, k)
+        wr = np.take_along_axis(p, idx, axis=-1)
+        S = wr.sum(-1, keepdims=True)
+        w = wr / S if sp.expert_norm else wr
+        if self.routing is not None:
+            self.routing[L] = (idx.copy(), w.copy())
+        out = np.zeros((T, h.shape[1]), dtype=F)
+        experts = {}
+        for e in np.unique(idx):
+            t, slot = np.nonzero(idx == e)
+            ht = h[t]
+            gt = ht @ b["exp_gate"][e].T
+            up = ht @ b["exp_up"][e].T
+            a, da = act_fwd(sp.act, gt)
+            y = (a * up) @ b["exp_down"][e].T                                # (n, d)
+            out[t] += w[t, slot][:, None] * y
+            if keep:
+                experts[int(e)] = (t, slot, a, da, up, y)
+        sh = None
+        if sp.shared_expert:
+            gt = h @ b["sh_gate"].T
+            up = h @ b["sh_up"].T
+            a, da = act_fwd(sp.act, gt)
+            out = out + (a * up) @ b["sh_down"].T
+            sh = (a, da, up)
+        return out, (dict(p=p, idx=idx, w=w, S=S, experts=experts, sh=sh) if keep else None)
+
+    def _moe_bwd(self, dout, b, c):
+        sp = self.spec
+        P, T, d = dout.shape
+        dh = np.zeros((P, T, d), dtype=F)
+        dw = np.zeros((P, T, sp.n_expert_used), dtype=F)
+        w = c["w"]
+        for e, (t, slot, a, da, up, y) in c["experts"].items():
+            g = dout[:, t, :]                                              # (P, n, d)
+            dw[:, t, slot] = (g * y[None]).sum(-1)
+            dm = mm(g * w[t, slot][None, :, None], b["exp_down"][e])       # (P, n, ff)
+            dh[:, t, :] += mm(dm * up * da, b["exp_gate"][e]) + mm(dm * a, b["exp_up"][e])
+        if sp.expert_norm:
+            dw = (dw - (dw * w[None]).sum(-1, keepdims=True)) / c["S"][None]
+        p = c["p"]
+        dp = np.zeros((P, T, p.shape[1]), dtype=F)
+        np.put_along_axis(dp, np.broadcast_to(c["idx"][None], dw.shape), dw, axis=-1)
+        dlog = p[None] * (dp - (dp * p[None]).sum(-1, keepdims=True))
+        dh += mm(dlog, b["router"])
+        if c["sh"] is not None:
+            a, da, up = c["sh"]
+            dm = mm(dout, b["sh_down"])
+            dh += mm(dm * up * da, b["sh_gate"]) + mm(dm * a, b["sh_up"])
+        return dh
+
+    def _mlp_fwd(self, h, b, keep, L=0):
+        sp = self.spec
+        if sp.n_expert:
+            return self._moe_fwd(h, b, keep, L)
         if sp.mlp == "gated":
             gt = self._lin(h, b["ffn_gate"], b["ffn_gate_b"])
             up = self._lin(h, b["ffn_up"], b["ffn_up_b"])
@@ -391,6 +468,8 @@ class NumpyRuntime:
         return out, (dict(da=da) if keep else None)
 
     def _mlp_bwd(self, dout, b, c):
+        if self.spec.n_expert:
+            return self._moe_bwd(dout, b, c)
         dm = mm(dout, b["ffn_down"])                                 # (P, T, ff)
         if self.spec.mlp == "gated":
             dg = dm * c["up"] * c["da"]
@@ -410,7 +489,7 @@ class NumpyRuntime:
             c["att_raw"] = att
             att, c["pn1"] = self._norm(att, b["post_attention_norm"], b["post_attention_norm_b"])
         if sp.parallel:
-            mo, c["mlp"] = self._mlp_fwd(h1, b, keep)
+            mo, c["mlp"] = self._mlp_fwd(h1, b, keep, L)
             x3 = x + rs * att + rs * mo
         else:
             x2 = x + rs * att
@@ -418,7 +497,7 @@ class NumpyRuntime:
             h2 = x2
             if sp.norm_pre:
                 h2, c["n2"] = self._norm(x2, b["ffn_norm"], b["ffn_norm_b"])
-            mo, c["mlp"] = self._mlp_fwd(h2, b, keep)
+            mo, c["mlp"] = self._mlp_fwd(h2, b, keep, L)
             if sp.norm_post:
                 c["mlp_raw"] = mo
                 mo, c["pn2"] = self._norm(mo, b["post_ffw_norm"], b["post_ffw_norm_b"])
@@ -467,6 +546,17 @@ class NumpyRuntime:
             x, _ = self._block_fwd(x, self.block(L), L, *ropes[L], keep=False)
         acts["resid_final"] = x
         return x, acts
+
+    def route(self, tokens) -> dict:
+        """MoE: {sloj: (izabrani eksperti (T,k), tezine (T,k))} za jedan prompt; {} za gust model."""
+        if not self.spec.n_expert:
+            return {}
+        self.routing = {}
+        try:
+            self.run_resid(tokens)
+            return self.routing
+        finally:
+            self.routing = None
 
     def forward_with_hooks(self, tokens, hook_points=None) -> dict:
         return self.run_resid(tokens, hook_points=hook_points)[1]

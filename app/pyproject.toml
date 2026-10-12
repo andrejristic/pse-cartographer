@@ -1,6 +1,6 @@
 [project]
 name = "pse-cartographer"
-version = "0.3.0"
+version = "0.4.0"
 description = "PSE Cartographer — live J-space cartography of a local GGUF model, on the PSE-A engine (numpy runtime, no PyTorch)"
 authors = [{ name = "Andrej Ristic", email = "andrej.s.ristic@gmail.com" }]
 license = "GPL-3.0-or-later"

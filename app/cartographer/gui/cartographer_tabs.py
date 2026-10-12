@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, Q
                                QTextEdit, QVBoxLayout, QWidget)
 
 from .. import drift as drift_mod
+from .. import routing as routing_mod
 from ..session import readouts_from_payload
 from .common import Canvas, RunPicker, esc
 
@@ -38,6 +39,7 @@ class CartographerWidget(QWidget):
         self.tabs.addTab(self._build_session_tab(), "Session")
         self.tabs.addTab(self._build_drift_tab(), "Drift / Diff")
         self.tabs.addTab(self._build_report_tab(), "Report")
+        self.tabs.addTab(self._build_experts_tab(), "Experts")
 
     def refresh(self, model_hash):
         self.picker.fill(self.main.lib, model_hash)
@@ -156,6 +158,7 @@ class CartographerWidget(QWidget):
         self._render_session(b)
         self._render_drift(b)
         self._render_report(b)
+        self._render_experts(b)
 
     # -- Basis tab ---------------------------------------------------------- #
     def _build_basis_tab(self):
@@ -283,3 +286,92 @@ class CartographerWidget(QWidget):
             f"<h3>What happened (plain language)</h3>"
             f"<p>{esc(b.get('narodski_report', '')).replace(chr(10), '<br>')}</p>"
             f"<h3>Expert note</h3><p style='color:#555'>{esc(b.get('expert_note', '')).replace(chr(10), '<br>')}</p>")
+
+    # -- Experts tab (mixture-of-experts routing) --------------------------- #
+    def _build_experts_tab(self):
+        from PySide6.QtWidgets import QSplitter, QTableWidget
+        from PySide6.QtCore import Qt
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.exp_note = QLabel()
+        self.exp_note.setWordWrap(True)
+        lay.addWidget(self.exp_note)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Routing for:"))
+        self.exp_prompt = QComboBox()
+        self.exp_prompt.currentIndexChanged.connect(self._draw_experts)
+        row.addWidget(self.exp_prompt, 1)
+        lay.addLayout(row)
+        sp = QSplitter(Qt.Vertical)
+        self.exp_canvas = Canvas(8, 4)
+        sp.addWidget(self.exp_canvas)
+        self.exp_table = QTableWidget()
+        sp.addWidget(self.exp_table)
+        lay.addWidget(sp, 1)
+        return w
+
+    def _render_experts(self, b):
+        outs = b["readouts"]
+        self._exp_b = b
+        moe = routing_mod.has_routing(outs)
+        self.exp_prompt.setEnabled(moe)
+        self.exp_table.setVisible(moe)
+        self.exp_canvas.setVisible(moe)
+        if not moe:
+            self.exp_note.setText("This model is dense: every token goes through the same MLP. Expert "
+                                  "routing appears here for mixture-of-experts models (Granite MoE, "
+                                  "OLMoE).")
+            return
+        s = routing_mod.summary(outs)
+        corr = s.get("drift_correlation")
+        self.exp_note.setText(
+            f"<b>Mixture of experts:</b> each token goes to {s['experts_per_token']} of "
+            f"{s['n_experts']} experts at every layer. Routing drift between prompts "
+            f"{s['mean_routing_drift']:.2f} on average (0 = same experts, 1 = all different)"
+            + (f"; it correlates with the concept drift at {corr:.2f}." if corr is not None else "."))
+        self.exp_prompt.blockSignals(True)
+        self.exp_prompt.clear()
+        self.exp_prompt.addItem("all prompts", None)
+        for i, r in enumerate(outs):
+            self.exp_prompt.addItem(f"{i}: {r.prompt[:40]}", i)
+        self.exp_prompt.blockSignals(False)
+        self._draw_experts()
+        from PySide6.QtWidgets import QTableWidgetItem
+        ec = routing_mod.expert_concepts(outs)
+        rows = [(L, e, cs) for L in sorted(ec) for e, cs in sorted(ec[L].items())]
+        self.exp_table.setColumnCount(3)
+        self.exp_table.setHorizontalHeaderLabels(["layer", "expert", "concepts held when this expert is chosen"])
+        self.exp_table.setRowCount(len(rows))
+        for i, (L, e, cs) in enumerate(rows):
+            for c, v in enumerate([f"L{L}", str(e), ", ".join(f"{t}" for t, _ in cs)]):
+                self.exp_table.setItem(i, c, QTableWidgetItem(v))
+        self.exp_table.resizeColumnsToContents()
+
+    def _draw_experts(self):
+        b = getattr(self, "_exp_b", None)
+        if not b or not routing_mod.has_routing(b["readouts"]):
+            return
+        outs = b["readouts"]
+        which = self.exp_prompt.currentData()
+        U = routing_mod.usage_matrix(outs, which)
+        layers = sorted(outs[0].routing)
+        f = self.exp_canvas.clear()
+        ax = f.add_subplot(1, 2, 1)
+        im = ax.imshow(U, aspect="auto", cmap="magma", interpolation="nearest")
+        ax.set_xlabel("expert")
+        ax.set_ylabel("layer")
+        ax.set_yticks(range(0, len(layers), max(1, len(layers) // 8)),
+                      [layers[k] for k in range(0, len(layers), max(1, len(layers) // 8))])
+        ax.set_title("Share of routed tokens per expert", fontsize=9)
+        f.colorbar(im, ax=ax, fraction=0.04)
+        ax2 = f.add_subplot(1, 2, 2)
+        rd = routing_mod.routing_drift(outs)
+        jd = drift_mod.drift(outs)
+        x = range(1, len(outs))
+        ax2.plot(x, rd, "o-", color="#e45756", label="routing drift")
+        ax2.plot(x, jd, "s--", color="#4c78a8", label="concept drift")
+        ax2.set_ylim(0, 1)
+        ax2.set_xlabel("prompt index")
+        ax2.set_title("Experts vs concepts, prompt to prompt", fontsize=9)
+        ax2.legend(fontsize=7)
+        self.exp_canvas.draw()

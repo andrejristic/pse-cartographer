@@ -68,7 +68,7 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
           qkv_bias=False, qk_norm="", tied=True, rope_freqs=False, sliding=None,
           spm=False, q8=False, seed=0, norm="rms", post_norm=False, pre_norm=True,
           parallel=False, mlp="gated", fused_qkv=False, fused_gate_up=False, all_bias=False,
-          rope_dim=None, extra=None, out_bias=False):
+          rope_dim=None, extra=None, out_bias=False, moe=None, shexp=False):
     rng = np.random.default_rng(seed)
     w = GGUFWriter(str(OUT / f"{name}.gguf"), arch)
     if spm:
@@ -110,6 +110,9 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
     w.add_rope_dimension_count(rope_dim or head_dim)
     if sliding:
         w.add_sliding_window(sliding)
+    if moe:
+        w.add_uint32(f"{arch}.expert_count", moe[0])
+        w.add_uint32(f"{arch}.expert_used_count", moe[1])
     for k, v in (extra or {}).items():                  # arch-specific keys
         if isinstance(v, str):
             w.add_string(f"{arch}.{k}", v)
@@ -169,7 +172,17 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
         put(p + "attn_output.weight", mat(d, nq))
         if all_bias:
             put(p + "attn_output.bias", vec(d))
-        if fused_gate_up:
+        if moe:
+            E = moe[0]
+            put(p + "ffn_gate_inp.weight", mat(E, d, 1.0))
+            put(p + "ffn_gate_exps.weight", np.stack([mat(ff, d) for _ in range(E)]))
+            put(p + "ffn_up_exps.weight", np.stack([mat(ff, d) for _ in range(E)]))
+            put(p + "ffn_down_exps.weight", np.stack([mat(d, ff) for _ in range(E)]))
+            if shexp:
+                put(p + "ffn_gate_shexp.weight", mat(ff, d))
+                put(p + "ffn_up_shexp.weight", mat(ff, d))
+                put(p + "ffn_down_shexp.weight", mat(d, ff))
+        elif fused_gate_up:
             put(p + "ffn_up.weight", mat(2 * ff, d), quant=q8)
         else:
             if mlp == "gated":
@@ -221,4 +234,8 @@ if __name__ == "__main__":
     build("tiny-granite", "granite", **small, seed=12,
           extra={"embedding_scale": 2.0, "residual_scale": 0.5, "logit_scale": 3.0,
                  "attention.scale": 0.2})
+    # phase 3: mixture of experts
+    build("tiny-granitemoe", "granitemoe", **small, moe=(6, 2), shexp=True, seed=14,
+          extra={"embedding_scale": 2.0, "residual_scale": 0.5, "logit_scale": 3.0})
+    build("tiny-olmoe", "olmoe", **small, moe=(8, 3), qk_norm="full", tied=False, seed=15)
     sys.exit(0)

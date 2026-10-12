@@ -1,6 +1,6 @@
 # PSE Cartographer — Vodič (srpski)
 
-Verzija 0.3.0. Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
+Verzija 0.4.0. Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
 
 ---
 
@@ -55,6 +55,11 @@ kasnije (**Cartographer → Choose spokesperson…**).
    riječi-sonde. **Report** = narodski raport + kratka stručna napomena.
 5. Svaki završen run je u biraču na vrhu, pa ga možeš kasnije ponovo otvoriti.
 
+**Experts** (samo za mixture-of-experts modele): druga mapa pored J-prostora. Na svakom sloju
+router šalje svaki token kod par eksperata od mnogih; ovaj tab pokazuje koji eksperti nose prompt
+(mapa: sloj × ekspert), koliko se izabrani eksperti mijenjaju od prompta do prompta (drift
+rutiranja, nacrtan pored drifta pojmova) i koje pojmove model drži kad je izabran neki ekspert.
+
 **Aktivni kartograf** (kvačica): glasnogovornik smišlja sljedeći prompt iz prethodnog očitanja —
 radni model vodi mapiranje umjesto fiksne liste.
 
@@ -106,9 +111,9 @@ ne citira označen je kao nepouzdan. Raport se pečati kao i svaki drugi rezulta
 
 ## 7. Instalacija
 
-- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.3.0_amd64.deb`, pa *PSE Cartographer*
+- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.4.0_amd64.deb`, pa *PSE Cartographer*
   iz menija ili `pse-cartographer`.
-- **Windows (.exe)**: pokreni `PSECartographer-Setup-0.3.0.exe` (ne treba admin).
+- **Windows (.exe)**: pokreni `PSECartographer-Setup-0.4.0.exe` (ne treba admin).
 - **Iz izvornog koda**: `cd app && ./setup.sh && ./run.sh` (Python 3.10+).
 
 Provjera instalacije bilo kad: `pse-cartographer --selftest` (bez interneta, bez modela).
@@ -119,8 +124,8 @@ Provjera instalacije bilo kad: `pse-cartographer --selftest` (bez interneta, bez
 
 - Arhitekture: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral, Gemma / Gemma 2 / Gemma 3,
   Phi-2, Phi-3 / 3.5, StableLM 2, OLMo 2, Granite 3** (i ostali koje llama.cpp piše kao `llama`,
-  npr. SmolLM2, Falcon 3, TinyLlama). Mixture-of-experts modeli još nisu podržani. Ostali se
-  odbiju pri otvaranju fajla, nikad usred rada.
+  npr. SmolLM2, Falcon 3, TinyLlama), i mixture-of-experts modeli **Granite 3 MoE** (1B-A400M,
+  3B-A800M) i **OLMoE**. Ostali se odbiju pri otvaranju fajla, nikad usred rada.
 - Kvantizacije: F32, F16, BF16, Q8_0, Q4_0/Q4_1, Q5_0/Q5_1, Q2_K–Q6_K, IQ4_NL.
 - Mašina: računar od 16 GB bez GPU-a (čak i bez AVX2) udobno mapira modele od **0,5–3B**
   (minute za 0,5B, ~10 minuta za 1B, duže za 3B). Veći modeli rade i kad ne stanu u RAM —

@@ -39,6 +39,7 @@ class PromptReadout:
     per_layer: list             # list[LayerReadout]
     ignition_layer: object      # int or None
     region_map: dict
+    routing: dict = None        # MoE: {layer: {"last": [(expert, weight)], "usage": [count per expert]}}
 
 
 def readout_from_acts(acts_by_layer: dict, final_probe_p: np.ndarray, bases: dict,
@@ -74,12 +75,24 @@ class CartographySession:
 
     def readout(self, prompt: str) -> PromptReadout:
         ids = self.rt.encode(prompt)
-        x, acts = self.rt.run_resid(ids, hook_points={f"resid_pre.{L}" for L in self.bases})
+        moe = bool(self.rt.spec.n_expert)
+        if moe:
+            self.rt.routing = {}                     # the same forward also records routing
+        try:
+            x, acts = self.rt.run_resid(ids, hook_points={f"resid_pre.{L}" for L in self.bases})
+            routing = self.rt.routing
+        finally:
+            self.rt.routing = None
         logit = (self.rt.final_norm(x[-1]) @ self._Wp.T).astype(np.float64)
         e = np.exp(logit - logit.max())
         r = readout_from_acts({L: acts[f"resid_pre.{L}"][-1] for L in self.bases},
                               e / e.sum(), self.bases)
         r.prompt = prompt
+        if moe:
+            E = self.rt.spec.n_expert
+            r.routing = {int(L): {"last": [(int(e), float(w)) for e, w in zip(idx[-1], wt[-1])],
+                                  "usage": np.bincount(idx.ravel(), minlength=E).tolist()}
+                         for L, (idx, wt) in routing.items()}
         self.readouts.append(r)
         return r
 
@@ -112,6 +125,7 @@ class CartographySession:
                 "per_layer": [{"layer": lr.layer, "var_frac": lr.var_frac,
                                "entropy": lr.entropy, "motor_kl": lr.motor_kl,
                                "top_concepts": lr.top_concepts} for lr in r.per_layer],
+                "routing": ({str(L): v for L, v in r.routing.items()} if r.routing else None),
             } for r in self.readouts],
         }
 
@@ -128,5 +142,7 @@ def readouts_from_payload(payload: dict) -> list:
         pl = [LayerReadout(x["layer"], x["var_frac"], x.get("entropy", 0.0),
                            x.get("motor_kl", 0.0), [tuple(c) for c in x["top_concepts"]])
               for x in r["per_layer"]]
-        out.append(PromptReadout(r["prompt"], pl, r["ignition_layer"], r.get("regions", {})))
+        rt = r.get("routing")
+        out.append(PromptReadout(r["prompt"], pl, r["ignition_layer"], r.get("regions", {}),
+                                 {int(L): v for L, v in rt.items()} if rt else None))
     return out

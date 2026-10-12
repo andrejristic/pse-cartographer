@@ -30,26 +30,34 @@ def unpermute(w, n_head):
 
 
 def gguf_state(path, arch, cfg, permuted):
+    """Yields (hf_name, fp32 array) one tensor at a time (never the whole model in RAM)."""
+    yield from _gguf_state(path, arch, cfg, permuted)
+
+
+def _gguf_state(path, arch, cfg, permuted):
     from pse_a.core.source.gguf import open_gguf
     from pse_a.core.source import dequant as dq
     g = open_gguf(path)
     t = lambda n: dq.tensor(g, n).astype(np.float32)
     has = lambda n: n in g.tensors
     H, KV = cfg.num_attention_heads, cfg.num_key_value_heads
-    sd = {"model.embed_tokens.weight": t("token_embd.weight")}
+    sd = {}
+    yield "model.embed_tokens.weight", t("token_embd.weight")
     pre = "model.layers.{L}."
     if arch == "phi2":
-        sd["model.final_layernorm.weight"] = t("output_norm.weight")
-        sd["model.final_layernorm.bias"] = t("output_norm.bias")
+        yield "model.final_layernorm.weight", t("output_norm.weight")
+        yield "model.final_layernorm.bias", t("output_norm.bias")
     else:
-        sd["model.norm.weight"] = t("output_norm.weight")
+        yield "model.norm.weight", t("output_norm.weight")
     if has("output.weight"):
-        sd["lm_head.weight"] = t("output.weight")
+        yield "lm_head.weight", t("output.weight")
     if has("output.bias"):
-        sd["lm_head.bias"] = t("output.bias")
+        yield "lm_head.bias", t("output.bias")
     for L in range(cfg.num_hidden_layers):
         p, q = f"blk.{L}.", pre.format(L=L)
-        if has(p + "attn_qkv.weight"):
+        if arch == "phi3":
+            parts = {}
+        elif has(p + "attn_qkv.weight"):
             qkv = t(p + "attn_qkv.weight")
             hd = cfg.hidden_size // H
             Q, K, V = np.split(qkv, [H * hd, (H + KV) * hd])
@@ -57,42 +65,63 @@ def gguf_state(path, arch, cfg, permuted):
             if has(p + "attn_qkv.bias"):
                 bq, bk, bv = np.split(t(p + "attn_qkv.bias"), [H * hd, (H + KV) * hd])
                 for n, b in (("q", bq), ("k", bk), ("v", bv)):
-                    sd[q + f"self_attn.{n}_proj.bias"] = b
+                    yield q + f"self_attn.{n}_proj.bias", b
         else:
             parts = {n: t(p + f"attn_{n}.weight") for n in "qkv"}
             for n in "qkv":
                 if has(p + f"attn_{n}.bias"):
-                    sd[q + f"self_attn.{n}_proj.bias"] = t(p + f"attn_{n}.bias")
+                    yield q + f"self_attn.{n}_proj.bias", t(p + f"attn_{n}.bias")
         if permuted:
             parts["q"], parts["k"] = unpermute(parts["q"], H), unpermute(parts["k"], KV)
         for n, w in parts.items():
-            sd[q + f"self_attn.{n}_proj.weight"] = w
+            yield q + f"self_attn.{n}_proj.weight", w
         if arch == "phi2":
-            sd[q + "self_attn.dense.weight"] = t(p + "attn_output.weight")
-            sd[q + "self_attn.dense.bias"] = t(p + "attn_output.bias")
-            sd[q + "input_layernorm.weight"] = t(p + "attn_norm.weight")
-            sd[q + "input_layernorm.bias"] = t(p + "attn_norm.bias")
-            sd[q + "mlp.fc1.weight"] = t(p + "ffn_up.weight")
-            sd[q + "mlp.fc1.bias"] = t(p + "ffn_up.bias")
-            sd[q + "mlp.fc2.weight"] = t(p + "ffn_down.weight")
-            sd[q + "mlp.fc2.bias"] = t(p + "ffn_down.bias")
+            yield q + "self_attn.dense.weight", t(p + "attn_output.weight")
+            yield q + "self_attn.dense.bias", t(p + "attn_output.bias")
+            yield q + "input_layernorm.weight", t(p + "attn_norm.weight")
+            yield q + "input_layernorm.bias", t(p + "attn_norm.bias")
+            yield q + "mlp.fc1.weight", t(p + "ffn_up.weight")
+            yield q + "mlp.fc1.bias", t(p + "ffn_up.bias")
+            yield q + "mlp.fc2.weight", t(p + "ffn_down.weight")
+            yield q + "mlp.fc2.bias", t(p + "ffn_down.bias")
             continue
-        sd[q + "self_attn.o_proj.weight"] = t(p + "attn_output.weight")
-        for a, b in (("ffn_gate", "gate_proj"), ("ffn_up", "up_proj"), ("ffn_down", "down_proj")):
-            sd[q + f"mlp.{b}.weight"] = t(p + f"{a}.weight")
+        if arch == "phi3":                                    # HF keeps qkv and gate_up fused
+            yield q + "self_attn.qkv_proj.weight", t(p + "attn_qkv.weight")
+            yield q + "self_attn.o_proj.weight", t(p + "attn_output.weight")
+            yield q + "mlp.gate_up_proj.weight", t(p + "ffn_up.weight")
+            yield q + "mlp.down_proj.weight", t(p + "ffn_down.weight")
+            yield q + "input_layernorm.weight", t(p + "attn_norm.weight")
+            yield q + "post_attention_layernorm.weight", t(p + "ffn_norm.weight")
+            continue
+        yield q + "self_attn.o_proj.weight", t(p + "attn_output.weight")
+        if has(p + "ffn_gate_inp.weight"):                     # mixture of experts
+            m = "block_sparse_moe" if arch == "granitemoe" else "mlp"
+            yield q + f"{m}.{'router' if arch == 'granitemoe' else 'gate'}.weight", t(p + "ffn_gate_inp.weight")
+            yield q + f"{m}.experts.gate_up_proj", np.concatenate(
+                [t(p + "ffn_gate_exps.weight"), t(p + "ffn_up_exps.weight")], axis=1)
+            yield q + f"{m}.experts.down_proj", t(p + "ffn_down_exps.weight")
+            if has(p + "ffn_up_shexp.weight"):
+                yield q + "shared_mlp.input_linear.weight", np.concatenate(
+                    [t(p + "ffn_gate_shexp.weight"), t(p + "ffn_up_shexp.weight")], axis=0)
+                yield q + "shared_mlp.output_linear.weight", t(p + "ffn_down_shexp.weight")
+        else:
+            for a, b in (("ffn_gate", "gate_proj"), ("ffn_up", "up_proj"), ("ffn_down", "down_proj")):
+                yield q + f"mlp.{b}.weight", t(p + f"{a}.weight")
+        if arch == "olmoe":
+            yield q + "self_attn.q_norm.weight", t(p + "attn_q_norm.weight")
+            yield q + "self_attn.k_norm.weight", t(p + "attn_k_norm.weight")
         if arch == "olmo2":
             qn, kn = t(p + "attn_q_norm.weight"), t(p + "attn_k_norm.weight")
             if permuted:      # the norm runs over the full vector, BEFORE rope: permute it too
                 qn = unpermute(qn[:, None], H)[:, 0]
                 kn = unpermute(kn[:, None], KV)[:, 0]
-            sd[q + "self_attn.q_norm.weight"] = qn
-            sd[q + "self_attn.k_norm.weight"] = kn
-            sd[q + "post_attention_layernorm.weight"] = t(p + "post_attention_norm.weight")
-            sd[q + "post_feedforward_layernorm.weight"] = t(p + "post_ffw_norm.weight")
+            yield q + "self_attn.q_norm.weight", qn
+            yield q + "self_attn.k_norm.weight", kn
+            yield q + "post_attention_layernorm.weight", t(p + "post_attention_norm.weight")
+            yield q + "post_feedforward_layernorm.weight", t(p + "post_ffw_norm.weight")
         else:
-            sd[q + "input_layernorm.weight"] = t(p + "attn_norm.weight")
-            sd[q + "post_attention_layernorm.weight"] = t(p + "ffn_norm.weight")
-    return sd
+            yield q + "input_layernorm.weight", t(p + "attn_norm.weight")
+            yield q + "post_attention_layernorm.weight", t(p + "ffn_norm.weight")
 
 
 def stage_hf(path, hf_dir, bf16, permuted):
@@ -105,12 +134,23 @@ def stage_hf(path, hf_dir, bf16, permuted):
     dt = torch.bfloat16 if bf16 else torch.float32
     if hf_dir:
         cfg = AutoConfig.from_pretrained(hf_dir)
-        model = AutoModelForCausalLM.from_config(cfg, dtype=dt)
-        sd = {k: torch.from_numpy(v).to(dt) for k, v in gguf_state(path, arch, cfg, permuted).items()}
-        if "lm_head.weight" not in sd and getattr(cfg, "tie_word_embeddings", False):
-            sd["lm_head.weight"] = sd["model.embed_tokens.weight"]
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        missing = [m for m in missing if "rotary" not in m]
+        from transformers.initialization import no_init_weights
+        with no_init_weights():          # every weight is overwritten from the GGUF anyway
+            model = AutoModelForCausalLM.from_config(cfg, dtype=dt)
+        params = dict(model.named_parameters())
+        seen, unexpected = set(), []
+        with torch.no_grad():
+            for k, v in gguf_state(path, arch, cfg, permuted):
+                if k not in params:
+                    unexpected.append(k)
+                    continue
+                params[k].copy_(torch.from_numpy(v))      # cast to dt in place, then free v
+                seen.add(k)
+                del v
+        if getattr(cfg, "tie_word_embeddings", False):
+            model.tie_weights()                         # lm_head shares the embedding
+            seen.add("lm_head.weight")
+        missing = [m for m in params if m not in seen]
         print("missing", missing[:6], "unexpected", unexpected[:6])
     else:
         model = AutoModelForCausalLM.from_pretrained(str(Path(path).parent), gguf_file=Path(path).name,
@@ -152,8 +192,14 @@ def stage_ours(path):
     h0 = acts[f"resid_pre.{L}"].copy()
     D = rng.standard_normal(h0.shape).astype(np.float32)
     eps = 1e-2 * float(np.abs(h0).mean())
+    if rt.spec.n_expert:
+        # top-k selection is a step function: a finite difference that crosses a routing
+        # switch measures the step, not the gradient. Freeze the experts chosen in the base
+        # pass (router WEIGHTS stay smooth) -- the analytic VJP must then match.
+        rt.force_routing = rt.route(ids)
     f = lambda h: float(rt.final_norm(rt.run_resid(ids, start_layer=L, x=h)[0][-1]) @ U[0])
     fd = (f(h0 + eps * D) - f(h0 - eps * D)) / (2 * eps)
+    rt.force_routing = None
     an = float((g * D).sum())
     print(f"VJP FD spot check layer {L}: fd {fd:.5g} analytic {an:.5g} rel {abs(fd - an) / abs(fd):.2e}")
     gen = list(rt.generate(rt.encode("The capital of France is"), max_new=8, temperature=0,

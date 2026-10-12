@@ -48,7 +48,9 @@ SUPPORTED_ARCHS = {
     "phi3": (ROPE_NEOX, "silu"),
     "phi2": (ROPE_NEOX, "gelu_tanh"),
     "stablelm": (ROPE_NEOX, "silu"),
-    "olmo2": (ROPE_NEOX, "silu"),      # izmereno: perplexity 16 (neox) vs 191 (norm)
+    "olmo2": (ROPE_NEOX, "silu"),
+    "granitemoe": (ROPE_NORM, "silu"),
+    "olmoe": (ROPE_NEOX, "silu"),      # izmereno: perplexity 16 (neox) vs 191 (norm)
 }
 
 
@@ -97,6 +99,11 @@ class ArchSpec:
     swa_layers: frozenset = frozenset()
     rope_local_base: float = 0.0  # >0: SWA slojevi koriste ovu bazu (gemma3)
     rope_global_factor: float = 1.0
+    # --- MoE (faza 3)
+    n_expert: int = 0             # 0 = gust model
+    n_expert_used: int = 0
+    expert_norm: bool = True      # ponovo normirati top-k tezine (granite da, olmoe ne)
+    shared_expert: bool = False
 
     @property
     def gqa_group(self) -> int:
@@ -146,19 +153,23 @@ def spec_from_gguf(g) -> ArchSpec:
     d_ff = _m(meta, arch, "feed_forward_length")
     if isinstance(d_ff, list):
         raise UnsupportedModel("per-layer FFN widths are not supported")
-    if has("blk.0.ffn_gate_inp.weight"):
-        raise UnsupportedModel("mixture-of-experts models are not supported yet")
+    moe = has("blk.0.ffn_gate_inp.weight")
+    if moe and not (has("blk.0.ffn_gate_exps.weight") and has("blk.0.ffn_up_exps.weight")):
+        raise UnsupportedModel("this mixture-of-experts layout is not supported")
     fused_qkv = has("blk.0.attn_qkv.weight")
-    need = ["token_embd.weight", "output_norm.weight", "blk.0.ffn_up.weight",
-            "blk.0.ffn_down.weight", "blk.0.attn_output.weight"]
+    ffn = "_exps" if moe else ""
+    need = ["token_embd.weight", "output_norm.weight", f"blk.0.ffn_up{ffn}.weight",
+            f"blk.0.ffn_down{ffn}.weight", "blk.0.attn_output.weight"]
     need += [] if fused_qkv else ["blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight"]
     for n in need:
         if not has(n):
             raise UnsupportedModel(f"expected tensor '{n}' is missing")
 
-    gated = has("blk.0.ffn_gate.weight")
-    up_rows = T["blk.0.ffn_up.weight"].shape[1]
+    gated = has("blk.0.ffn_gate.weight") or moe
+    up_rows = T[f"blk.0.ffn_up{ffn}.weight"].shape[1]
     fused_gate_up = (not gated) and arch == "phi3"
+    if moe:
+        d_ff = _m(meta, arch, "expert_feed_forward_length") or up_rows
     if d_ff is None:
         d_ff = up_rows // (2 if fused_gate_up else 1)
     d_ff = int(d_ff)
@@ -201,6 +212,11 @@ def spec_from_gguf(g) -> ArchSpec:
         fused_qkv=fused_qkv, fused_gate_up=fused_gate_up)
     if has("rope_freqs.weight"):
         s.rope_factors = "rope_freqs.weight"
+    if moe:
+        s.n_expert = int(_m(meta, arch, "expert_count", T["blk.0.ffn_gate_inp.weight"].shape[1]))
+        s.n_expert_used = int(_m(meta, arch, "expert_used_count", 2))
+        s.expert_norm = bool(_m(meta, arch, "expert_weights_norm", arch != "olmoe"))
+        s.shared_expert = has("blk.0.ffn_up_shexp.weight")
 
     scaling = _m(meta, arch, "rope.scaling.type")
     factor = float(_m(meta, arch, "rope.scaling.factor", 1.0) or 1.0)
@@ -227,7 +243,7 @@ def spec_from_gguf(g) -> ArchSpec:
             s.rope_factors = "rope_factors_short.weight"
             s.rope_attn_factor = float(_m(meta, arch, "rope.scaling.attn_factor", 1.0) or 1.0)
             notes.append("long-context RoPE: short-range factors are used (prompts here are short)")
-    elif arch == "granite":
+    elif arch in ("granite", "granitemoe"):
         s.embed_scale = float(_m(meta, arch, "embedding_scale", 1.0) or 1.0)
         s.residual_scale = float(_m(meta, arch, "residual_scale", 1.0) or 1.0)
         s.logit_scale = float(_m(meta, arch, "logit_scale", 1.0) or 1.0)
