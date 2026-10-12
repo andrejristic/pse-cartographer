@@ -65,8 +65,10 @@ def spm_vocab():
 
 
 def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, layers=3,
-          qkv_bias=False, qk_norm=False, tied=True, rope_freqs=False, sliding=None,
-          spm=False, q8=False, seed=0):
+          qkv_bias=False, qk_norm="", tied=True, rope_freqs=False, sliding=None,
+          spm=False, q8=False, seed=0, norm="rms", post_norm=False, pre_norm=True,
+          parallel=False, mlp="gated", fused_qkv=False, fused_gate_up=False, all_bias=False,
+          rope_dim=None, extra=None, out_bias=False):
     rng = np.random.default_rng(seed)
     w = GGUFWriter(str(OUT / f"{name}.gguf"), arch)
     if spm:
@@ -100,15 +102,28 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
     w.add_head_count_kv(n_kv)
     w.add_key_length(head_dim)
     w.add_value_length(head_dim)
-    w.add_layer_norm_rms_eps(1e-5)
+    if norm == "layer":
+        w.add_layer_norm_eps(1e-5)
+    else:
+        w.add_layer_norm_rms_eps(1e-5)
     w.add_rope_freq_base(10000.0)
-    w.add_rope_dimension_count(head_dim)
+    w.add_rope_dimension_count(rope_dim or head_dim)
     if sliding:
         w.add_sliding_window(sliding)
+    for k, v in (extra or {}).items():                  # arch-specific keys
+        if isinstance(v, str):
+            w.add_string(f"{arch}.{k}", v)
+        elif isinstance(v, int):
+            w.add_uint32(f"{arch}.{k}", v)
+        else:
+            w.add_float32(f"{arch}.{k}", float(v))
 
     def mat(rows, cols, scale=None):
         s = scale or 1.0 / np.sqrt(cols)
         return (rng.standard_normal((rows, cols)) * s).astype(np.float32)
+
+    def vec(n, mean=0.0, sd=0.1):
+        return (mean + sd * rng.standard_normal(n)).astype(np.float32)
 
     def put(nm, arr, quant=False):
         if quant:
@@ -117,29 +132,60 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
         else:
             w.add_tensor(nm, arr)
 
+    def norm_t(prefix, n):
+        put(prefix + ".weight", vec(n, 1.0))
+        if norm == "layer":
+            put(prefix + ".bias", vec(n))
+
     put("token_embd.weight", mat(V, d, 1.0))
     if not tied:
         put("output.weight", mat(V, d))
-    put("output_norm.weight", (1 + 0.1 * rng.standard_normal(d)).astype(np.float32))
+    if out_bias:
+        put("output.bias", vec(V))
+    norm_t("output_norm", d)
     if rope_freqs:
-        put("rope_freqs.weight", np.linspace(1.0, 8.0, head_dim // 2).astype(np.float32))
+        put("rope_freqs.weight", np.linspace(1.0, 8.0, (rope_dim or head_dim) // 2).astype(np.float32))
+    nq, nk = n_head * head_dim, n_kv * head_dim
     for L in range(layers):
         p = f"blk.{L}."
-        put(p + "attn_norm.weight", (1 + 0.1 * rng.standard_normal(d)).astype(np.float32))
-        put(p + "ffn_norm.weight", (1 + 0.1 * rng.standard_normal(d)).astype(np.float32))
-        put(p + "attn_q.weight", mat(n_head * head_dim, d))
-        put(p + "attn_k.weight", mat(n_kv * head_dim, d))
-        put(p + "attn_v.weight", mat(n_kv * head_dim, d))
-        put(p + "attn_output.weight", mat(d, n_head * head_dim))
-        put(p + "ffn_gate.weight", mat(ff, d), quant=q8)
-        put(p + "ffn_up.weight", mat(ff, d), quant=q8)
+        if pre_norm:
+            norm_t(p + "attn_norm", d)
+            if not parallel:
+                norm_t(p + "ffn_norm", d)
+        if post_norm:
+            norm_t(p + "post_attention_norm", d)
+            norm_t(p + "post_ffw_norm", d)
+        if fused_qkv:
+            put(p + "attn_qkv.weight", mat(nq + 2 * nk, d))
+            if qkv_bias or all_bias:
+                put(p + "attn_qkv.bias", vec(nq + 2 * nk))
+        else:
+            put(p + "attn_q.weight", mat(nq, d))
+            put(p + "attn_k.weight", mat(nk, d))
+            put(p + "attn_v.weight", mat(nk, d))
+            if qkv_bias or all_bias:
+                for k, n in (("attn_q", nq), ("attn_k", nk), ("attn_v", nk)):
+                    put(p + k + ".bias", vec(n))
+        put(p + "attn_output.weight", mat(d, nq))
+        if all_bias:
+            put(p + "attn_output.bias", vec(d))
+        if fused_gate_up:
+            put(p + "ffn_up.weight", mat(2 * ff, d), quant=q8)
+        else:
+            if mlp == "gated":
+                put(p + "ffn_gate.weight", mat(ff, d), quant=q8)
+            put(p + "ffn_up.weight", mat(ff, d), quant=q8)
+            if all_bias:
+                put(p + "ffn_up.bias", vec(ff))
         put(p + "ffn_down.weight", mat(d, ff), quant=q8)
-        if qkv_bias:
-            for k, n in (("attn_q", n_head), ("attn_k", n_kv), ("attn_v", n_kv)):
-                put(p + k + ".bias", (0.1 * rng.standard_normal(n * head_dim)).astype(np.float32))
-        if qk_norm:
-            put(p + "attn_q_norm.weight", (1 + 0.1 * rng.standard_normal(head_dim)).astype(np.float32))
-            put(p + "attn_k_norm.weight", (1 + 0.1 * rng.standard_normal(head_dim)).astype(np.float32))
+        if all_bias:
+            put(p + "ffn_down.bias", vec(d))
+        if qk_norm == "head":
+            put(p + "attn_q_norm.weight", vec(head_dim, 1.0))
+            put(p + "attn_k_norm.weight", vec(head_dim, 1.0))
+        elif qk_norm == "full":
+            put(p + "attn_q_norm.weight", vec(nq, 1.0))
+            put(p + "attn_k_norm.weight", vec(nk, 1.0))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -149,9 +195,30 @@ def build(name: str, arch: str, *, d=64, n_head=4, n_kv=2, head_dim=16, ff=96, l
 
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
+    small = dict(d=32, n_head=4, n_kv=2, head_dim=8, ff=48, layers=3)
+    # phase 1
     build("tiny-qwen2", "qwen2", qkv_bias=True, q8=True, seed=1)
-    build("tiny-qwen3", "qwen3", qk_norm=True, head_dim=24, seed=2)       # head_dim != d/n_head
+    build("tiny-qwen3", "qwen3", qk_norm="head", head_dim=24, seed=2)       # head_dim != d/n_head
     build("tiny-llama3", "llama", tied=False, rope_freqs=True, seed=3)
     build("tiny-llama-spm", "llama", tied=False, spm=True, n_kv=4, seed=4)  # SentencePiece, MHA
     build("tiny-mistral", "llama", tied=False, sliding=3, spm=True, seed=5)  # sliding window
+    # phase 2 (smaller: they carry more switches)
+    build("tiny-gemma", "gemma", **small, spm=True, seed=13)                # Gemma 1: no post norms
+    build("tiny-gemma2", "gemma2", **small, post_norm=True, sliding=3, spm=True, seed=6,
+          extra={"attn_logit_softcapping": 3.0, "final_logit_softcapping": 5.0})
+    build("tiny-gemma3", "gemma3", **{**small, "layers": 4}, post_norm=True, qk_norm="head",
+          sliding=3, spm=True, tied=False, seed=7,
+          extra={"attention.sliding_window_pattern": 2, "rope.scaling.type": "linear",
+                 "rope.scaling.factor": 4.0})
+    build("tiny-phi3", "phi3", **small, fused_qkv=True, fused_gate_up=True, mlp="plain",
+          tied=False, spm=True, seed=8)
+    build("tiny-phi2", "phi2", **{**small, "n_kv": 4}, norm="layer", parallel=True, mlp="plain",
+          fused_qkv=True, all_bias=True, rope_dim=4, tied=False, out_bias=True, seed=9)
+    build("tiny-stablelm", "stablelm", **small, norm="layer", qkv_bias=True, rope_dim=4,
+          tied=False, seed=10)
+    build("tiny-olmo2", "olmo2", **small, pre_norm=False, post_norm=True, qk_norm="full",
+          tied=False, seed=11)
+    build("tiny-granite", "granite", **small, seed=12,
+          extra={"embedding_scale": 2.0, "residual_scale": 0.5, "logit_scale": 3.0,
+                 "attention.scale": 0.2})
     sys.exit(0)

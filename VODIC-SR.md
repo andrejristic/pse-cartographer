@@ -1,6 +1,6 @@
 # PSE Cartographer — Vodič (srpski)
 
-Verzija 0.2.0. Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
+Verzija 0.3.0. Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
 
 ---
 
@@ -106,9 +106,9 @@ ne citira označen je kao nepouzdan. Raport se pečati kao i svaki drugi rezulta
 
 ## 7. Instalacija
 
-- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.2.0_amd64.deb`, pa *PSE Cartographer*
+- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.3.0_amd64.deb`, pa *PSE Cartographer*
   iz menija ili `pse-cartographer`.
-- **Windows (.exe)**: pokreni `PSECartographer-Setup-0.2.0.exe` (ne treba admin).
+- **Windows (.exe)**: pokreni `PSECartographer-Setup-0.3.0.exe` (ne treba admin).
 - **Iz izvornog koda**: `cd app && ./setup.sh && ./run.sh` (Python 3.10+).
 
 Provjera instalacije bilo kad: `pse-cartographer --selftest` (bez interneta, bez modela).
@@ -117,8 +117,10 @@ Provjera instalacije bilo kad: `pse-cartographer --selftest` (bez interneta, bez
 
 ## 8. Podržani modeli i ograničenja
 
-- Arhitekture: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral** (i ostali koje llama.cpp
-  piše kao `llama`). Ostali se odbiju pri otvaranju fajla, nikad usred rada.
+- Arhitekture: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral, Gemma / Gemma 2 / Gemma 3,
+  Phi-2, Phi-3 / 3.5, StableLM 2, OLMo 2, Granite 3** (i ostali koje llama.cpp piše kao `llama`,
+  npr. SmolLM2, Falcon 3, TinyLlama). Mixture-of-experts modeli još nisu podržani. Ostali se
+  odbiju pri otvaranju fajla, nikad usred rada.
 - Kvantizacije: F32, F16, BF16, Q8_0, Q4_0/Q4_1, Q5_0/Q5_1, Q2_K–Q6_K, IQ4_NL.
 - Mašina: računar od 16 GB bez GPU-a (čak i bez AVX2) udobno mapira modele od **0,5–3B**
   (minute za 0,5B, ~10 minuta za 1B, duže za 3B). Veći modeli rade i kad ne stanu u RAM —
