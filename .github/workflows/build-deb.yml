@@ -1,0 +1,43 @@
+name: build-deb
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt pyinstaller
+      - name: Selftest from source (headless, no network, no models)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+          .venv/bin/python main.py --selftest
+      - name: Build .deb
+        run: bash packaging/build_deb.sh
+      - name: Install
+        run: sudo apt-get install -y ../dist/pse-cartographer_*_amd64.deb
+      - name: Selftest of the installed package (headless)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pse-cartographer --selftest
+      - name: SHA256
+        run: cd ../dist && sha256sum *.deb > SHA256SUMS-deb.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pse-cartographer-deb
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS-deb.txt

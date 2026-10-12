@@ -1,58 +1,36 @@
 """
 Cartographer tab group (C4 + C7 render).
 
-The dedicated flow for dissecting a local GGUF patient. The FIRST tab asks for the GGUF
-path (disk or USB) and checks torch support; the rest render the live J-space cartography:
-Basis (which layers mapped), Session (per-prompt readouts), Drift/Diff (the heart — how the
-J-space moves), and Report (the narodski report + expert note).
+The dedicated flow for dissecting a local GGUF patient. The FIRST tab asks for the GGUF path
+(disk or USB) and shows what this machine can do with it; the rest render the J-space
+cartography: Basis (which layers were mapped, with which probe words), Session (per-prompt
+readouts), Drift / Diff (the heart — how the J-space moves) and Report (the plain-language
+report + expert note). Earlier sealed cartography runs can be reopened from the run picker.
 
-Heavy work runs in a worker thread so the UI never freezes.
+Heavy work runs in the window's job runner so the UI never freezes.
 """
 from __future__ import annotations
 
-import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QProgressBar, QPushButton, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QCheckBox,
-)
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+import os
+
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget,
+                               QTextEdit, QVBoxLayout, QWidget)
 
 from .. import drift as drift_mod
-from .torch_install import TorchInstaller, commands_text, torch_available
-
-
-class AnalyzeWorker(QObject):
-    progress = Signal(str, int, int)     # stage, i, n
-    done = Signal(object)                # bundle
-    failed = Signal(str)
-
-    def __init__(self, orchestrator, path, active):
-        super().__init__()
-        self.orch = orchestrator
-        self.path = path
-        self.active = active
-
-    def run(self):
-        try:
-            bundle = self.orch.analyze_patient(
-                self.path, active=self.active,
-                progress=lambda stage, i, n: self.progress.emit(stage, i, n))
-            self.done.emit(bundle)
-        except Exception as e:
-            self.failed.emit(f"{type(e).__name__}: {e}")
+from ..session import readouts_from_payload
+from .common import Canvas, RunPicker, esc
 
 
 class CartographerWidget(QWidget):
     def __init__(self, main):
         super().__init__()
-        self.main = main                 # CartographerWindow (holds lib + psel)
-        self._orch = None
+        self.main = main
         self._bundle = None
-        self._threads = []
-
         outer = QVBoxLayout(self)
+        self.picker = RunPicker(("cartography",), "Sealed cartography run:")
+        self.picker.changed.connect(self._load_run)
+        outer.addWidget(self.picker)
         self.tabs = QTabWidget()
         outer.addWidget(self.tabs)
         self.tabs.addTab(self._build_patient_tab(), "Patient")
@@ -61,161 +39,216 @@ class CartographerWidget(QWidget):
         self.tabs.addTab(self._build_drift_tab(), "Drift / Diff")
         self.tabs.addTab(self._build_report_tab(), "Report")
 
+    def refresh(self, model_hash):
+        self.picker.fill(self.main.lib, model_hash)
+        p = self.main.path_of(model_hash) if model_hash else None
+        if p and not self.path_edit.text():
+            self.path_edit.setText(p)
+
     # -- Patient tab (first: give me the GGUF path) ------------------------- #
     def _build_patient_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("<h3>Patient — local GGUF to dissect</h3>"))
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel("<h3>Patient — the local GGUF to dissect</h3>"))
         row = QHBoxLayout()
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("path to a local .gguf (disk or USB)")
-        browse = QPushButton("Browse…"); browse.clicked.connect(self._browse_patient)
-        row.addWidget(self.path_edit); row.addWidget(browse)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse_patient)
+        row.addWidget(self.path_edit)
+        row.addWidget(browse)
         lay.addLayout(row)
-
-        self.torch_status = QLabel()
-        lay.addWidget(self.torch_status)
-        self.install_log = QPlainTextEdit(); self.install_log.setReadOnly(True)
-        self.install_log.setMaximumHeight(160); self.install_log.setVisible(False)
-        lay.addWidget(self.install_log)
-        self.install_btn = QPushButton("Install dissection support (torch + transformers)")
-        self.install_btn.clicked.connect(self._install_torch)
-        lay.addWidget(self.install_btn)
-
-        self.active_chk = QCheckBox("Active cartographer (spokesperson generates the probes)")
-        lay.addWidget(self.active_chk)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        opt = QHBoxLayout()
+        opt.addWidget(QLabel("probe words"))
+        self.n_probes = QSpinBox()
+        self.n_probes.setRange(16, 512)
+        self.n_probes.setValue(128)
+        opt.addWidget(self.n_probes)
+        self.active_chk = QCheckBox("Active cartographer (the spokesperson writes the next prompt)")
+        opt.addWidget(self.active_chk)
+        opt.addStretch(1)
+        lay.addLayout(opt)
+        lay.addWidget(QLabel("Prompts to feed (one per line; empty = the built-in ambiguous battery):"))
+        self.battery = QPlainTextEdit()
+        self.battery.setMaximumHeight(140)
+        lay.addWidget(self.battery)
         self.analyze_btn = QPushButton("Analyze patient")
         self.analyze_btn.clicked.connect(self._analyze)
         lay.addWidget(self.analyze_btn)
-        self.progress = QProgressBar(); self.progress.setVisible(False)
-        lay.addWidget(self.progress)
+        lay.addWidget(QLabel(
+            "<p style='color:#888'>Order: spectral anatomy (L1, once per model) → J-space basis for "
+            "every layer → readout of each prompt → drift → report → seal. The basis is cached, so "
+            "a second session on the same model is fast.</p>"))
         lay.addStretch(1)
-        self._refresh_torch()
         return w
-
-    def _refresh_torch(self):
-        if torch_available():
-            self.torch_status.setText("✅ torch + transformers present — dissection enabled.")
-            self.install_btn.setVisible(False)
-        else:
-            self.torch_status.setText(
-                "⚠ torch/transformers not installed — L0/L1 still work, but J-space "
-                "cartography needs them. Copy-paste, or use the button:\n\n"
-                + commands_text(cpu=True))
-            self.install_btn.setVisible(True)
 
     def _browse_patient(self):
         p, _ = QFileDialog.getOpenFileName(self, "Patient GGUF", "", "GGUF (*.gguf)")
         if p:
             self.path_edit.setText(p)
-
-    def _install_torch(self):
-        self.install_log.setVisible(True); self.install_btn.setEnabled(False)
-        inst = TorchInstaller(cpu=True, parent=self)
-        inst.line.connect(lambda s: self.install_log.appendPlainText(s))
-        inst.finished.connect(self._install_done)
-        inst.start()
-
-    def _install_done(self, ok):
-        self.install_btn.setEnabled(True)
-        self._refresh_torch()
-        self.install_log.appendPlainText("\n== done ==" if ok else "\n== still missing ==")
+            self.main.model_tab.open_path(p)
 
     def _analyze(self):
         path = self.path_edit.text().strip()
-        if not path:
-            self.torch_status.setText("Give a GGUF path first."); return
-        if self._orch is None:
-            from ..orchestrator import Orchestrator
-            self._orch = Orchestrator(self.main.lib, self.main.psel)
-        self.progress.setVisible(True); self.analyze_btn.setEnabled(False)
-        w = AnalyzeWorker(self._orch, path, self.active_chk.isChecked())
-        t = QThread(self)
-        w.moveToThread(t); t.started.connect(w.run)
-        w.progress.connect(self._on_progress)
-        w.done.connect(self._on_done); w.failed.connect(self._on_failed)
-        self._threads.append((t, w)); t.start()
-
-    def _on_progress(self, stage, i, n):
-        self.progress.setMaximum(n); self.progress.setValue(i)
-        self.main.statusBar().showMessage(f"{stage}: {i}/{n}", 2000)
+        if not path or not os.path.isfile(path):
+            self.status.setText("Give a GGUF path first.")
+            return
+        from ..orchestrator import DEFAULT_BATTERY, Orchestrator
+        battery = [l.strip() for l in self.battery.toPlainText().splitlines() if l.strip()] or DEFAULT_BATTERY
+        if self.active_chk.isChecked() and not self.main.voice.has_voice():
+            self.status.setText("Active cartographer needs a spokesperson — choose one from the "
+                                "Cartographer menu, or uncheck it.")
+            return
+        orch = Orchestrator(self.main.lib, self.main.voice, self.main.data_root)
+        n, active = self.n_probes.value(), self.active_chk.isChecked()
+        m = self.main.machine()
+        self.status.setText("Working… (progress in the status bar)")
+        self.main.run_job(
+            "J-space cartography",
+            lambda prog: orch.analyze_patient(path, battery=battery, active=active, n_probes=n,
+                                              progress=prog, rates=self.main.rates(),
+                                              ram_bytes=m.ram_bytes),
+            on_done=self._on_done, on_fail=self._on_failed)
 
     def _on_failed(self, msg):
-        self.progress.setVisible(False); self.analyze_btn.setEnabled(True)
-        self.torch_status.setText(f"Analysis unavailable: {msg}\n\n"
-                                  + commands_text(cpu=True))
+        self.status.setText(f"Analysis not done: {esc(msg)}")
 
     def _on_done(self, bundle):
-        self.progress.setVisible(False); self.analyze_btn.setEnabled(True)
         self._bundle = bundle
-        self._render_basis(bundle); self._render_session(bundle)
-        self._render_drift(bundle); self._render_report(bundle)
-        self.tabs.setCurrentIndex(3)     # jump to Drift / Diff — the heart
+        seal = ("sealed into the dossier" if bundle.get("sealed")
+                else f"measured but not sealed — {bundle.get('refused', '')}")
+        self.main.mission_finished("J-space cartography", bundle)   # refreshes every panel
+        self.status.setText(f"Done: {len(bundle['readouts'])} prompts, {len(bundle['layers_mapped'])} "
+                            f"layers; {seal}.")
+        # show THIS run, not whatever the refreshed run picker selected
+        self.picker.box.blockSignals(True)
+        i = self.picker.box.findData(bundle.get("run_id"))
+        if i >= 0:
+            self.picker.box.setCurrentIndex(i)
+        else:
+            self.picker.box.insertItem(0, "this session (not sealed)", "")
+            self.picker.box.setCurrentIndex(0)
+        self.picker.box.blockSignals(False)
+        self._render_all(bundle)
+        self.tabs.setCurrentIndex(3)                      # jump to Drift / Diff — the heart
+
+    def _load_run(self, run_id):
+        if not run_id:
+            return
+        art, _ = self.main.lib.artifact_json(run_id, "cartography.json")
+        rep, _ = self.main.lib.artifact_json(run_id, "report.json")
+        if art is None:
+            return
+        b = {"model": {"display_name": art.get("model"), "n_layers": art.get("n_layers")},
+             "layers_mapped": art["layers_mapped"], "probes": art.get("probes", []),
+             "readouts": readouts_from_payload(art), "session_summary": art.get("summary", {}),
+             "narodski_report": (rep or {}).get("plain_report", ""),
+             "expert_note": (rep or {}).get("expert_note", ""), "voice": (rep or {}).get("voice"),
+             "sealed": True, "run_id": run_id}
+        self._bundle = b
+        self._render_all(b)
+
+    def _render_all(self, b):
+        self._render_basis(b)
+        self._render_session(b)
+        self._render_drift(b)
+        self._render_report(b)
 
     # -- Basis tab ---------------------------------------------------------- #
     def _build_basis_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        self.basis_body = QTextEdit(); self.basis_body.setReadOnly(True)
-        lay.addWidget(self.basis_body); return w
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.basis_body = QTextEdit()
+        self.basis_body.setReadOnly(True)
+        lay.addWidget(self.basis_body)
+        return w
 
     def _render_basis(self, b):
+        probes = b.get("probes")
+        if probes is None and b.get("readouts"):
+            probes = []
         self.basis_body.setHtml(
-            f"<h3>J-space basis</h3><p>Mapped layers: <b>{b['layers_mapped']}</b> · "
-            f"model {b['model']['display_name']} ({b['model']['n_layers']} layers).</p>"
-            f"<p style='color:#888'>The basis (averaged lens rows) is estimated once and "
-            f"cached; per-prompt readouts reuse it.</p>")
+            f"<h3>J-space basis</h3><p>Mapped layers: <b>{b['layers_mapped']}</b> · model "
+            f"{esc(b['model']['display_name'])} ({b['model']['n_layers']} layers)"
+            + (" · basis loaded from cache" if b.get("basis_cached") else "") + ".</p>"
+            "<p style='color:#888'>For each layer, the averaged lens rows W_U·J_l of the probe words "
+            "are estimated once (one backward pass per calibration prompt covers every layer) and "
+            "cached; per-prompt readouts reuse them.</p>"
+            + (f"<p><b>Probe words</b>: {esc(', '.join(probes))}</p>" if probes else ""))
 
     # -- Session tab -------------------------------------------------------- #
     def _build_session_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        self.session_body = QTextEdit(); self.session_body.setReadOnly(True)
-        lay.addWidget(self.session_body); return w
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.session_body = QTextEdit()
+        self.session_body.setReadOnly(True)
+        lay.addWidget(self.session_body)
+        return w
 
     def _render_session(self, b):
-        parts = ["<h3>Per-prompt readouts</h3>"]
+        parts = ["<h3>Per-prompt readouts</h3><p style='color:#888'>Concepts are read at the "
+                 "ignition layer when one is found, otherwise at the layer with the largest J-space "
+                 "share.</p>"]
         for r in b["readouts"]:
             lr = drift_mod.representative_layer(r)
-            chips = ", ".join(lbl for lbl, _ in (lr.top_concepts[:12] if lr else []))
-            parts.append(f"<p><b>{r.prompt}</b><br>ignition@L{r.ignition_layer} · "
-                         f"holds: {chips}</p>")
+            chips = ", ".join(esc(lbl) for lbl, _ in (lr.top_concepts[:12] if lr else []))
+            ign = f"ignition @ L{r.ignition_layer}" if r.ignition_layer is not None else "no ignition"
+            parts.append(f"<p><b>{esc(r.prompt)}</b><br>{ign} · read at L{lr.layer if lr else '?'} · "
+                         f"share {lr.var_frac if lr else 0:.3f} · holds: {chips}</p>")
         self.session_body.setHtml("".join(parts))
 
     # -- Drift / Diff tab (the heart) --------------------------------------- #
     def _build_drift_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        self.fig = Figure(figsize=(7, 4), tight_layout=True)
-        self.canvas = FigureCanvas(self.fig); lay.addWidget(self.canvas)
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.canvas = Canvas(7, 4)
+        lay.addWidget(self.canvas)
         row = QHBoxLayout()
-        self.diff_a = QComboBox(); self.diff_b = QComboBox()
-        diff_btn = QPushButton("Diff A → B"); diff_btn.clicked.connect(self._show_diff)
-        row.addWidget(QLabel("A:")); row.addWidget(self.diff_a)
-        row.addWidget(QLabel("B:")); row.addWidget(self.diff_b); row.addWidget(diff_btn)
+        self.diff_a = QComboBox()
+        self.diff_b = QComboBox()
+        diff_btn = QPushButton("Diff A → B")
+        diff_btn.clicked.connect(self._show_diff)
+        row.addWidget(QLabel("A:"))
+        row.addWidget(self.diff_a)
+        row.addWidget(QLabel("B:"))
+        row.addWidget(self.diff_b)
+        row.addWidget(diff_btn)
         lay.addLayout(row)
-        self.diff_body = QTextEdit(); self.diff_body.setReadOnly(True)
-        self.diff_body.setMaximumHeight(150); lay.addWidget(self.diff_body)
+        self.diff_body = QTextEdit()
+        self.diff_body.setReadOnly(True)
+        self.diff_body.setMaximumHeight(150)
+        lay.addWidget(self.diff_body)
         return w
 
     def _render_drift(self, b):
         outs = b["readouts"]
         d = drift_mod.drift(outs)
         igs = drift_mod.ignition_track(outs)
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
+        f = self.canvas.clear()
+        ax = f.add_subplot(111)
         if d:
-            ax.bar(range(1, len(outs)), d, color="#4c78a8")
-        ax.set_ylim(0, 1); ax.set_xlabel("prompt index")
+            ax.bar(range(1, len(outs)), d, color="#4c78a8", label="drift vs previous")
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("prompt index")
         ax.set_ylabel("J-space drift vs previous (0..1)")
         ax.set_title("How the held concepts move, prompt by prompt")
         ax2 = ax.twinx()
-        ax2.plot(range(len(outs)), [(-1 if i is None else i) for i in igs],
-                 "o--", color="#e45756", label="ignition layer")
-        ax2.set_ylabel("ignition layer"); ax2.legend(fontsize=8)
+        ax2.plot(range(len(outs)), [(-1 if i is None else i) for i in igs], "o--", color="#e45756",
+                 label="ignition layer (−1 = none)")
+        ax2.set_ylabel("ignition layer")
+        ax2.legend(fontsize=8, loc="upper right")
         self.canvas.draw()
-        self.diff_a.clear(); self.diff_b.clear()
+        self.diff_a.clear()
+        self.diff_b.clear()
         for i, r in enumerate(outs):
             self.diff_a.addItem(f"{i}: {r.prompt[:30]}", i)
             self.diff_b.addItem(f"{i}: {r.prompt[:30]}", i)
         if len(outs) > 1:
             self.diff_b.setCurrentIndex(1)
+        self.diff_body.clear()
 
     def _show_diff(self):
         if not self._bundle:
@@ -226,21 +259,27 @@ class CartographerWidget(QWidget):
             return
         di = drift_mod.diff(outs[a], outs[b])
         self.diff_body.setHtml(
-            f"<b>Turned ON:</b> {', '.join(di['turned_on']) or '—'}<br>"
-            f"<b>Turned OFF:</b> {', '.join(di['turned_off']) or '—'}<br>"
-            f"<b>Shared:</b> {', '.join(di['shared']) or '—'}<br>"
+            f"<b>Turned ON:</b> {esc(', '.join(di['turned_on'])) or '—'}<br>"
+            f"<b>Turned OFF:</b> {esc(', '.join(di['turned_off'])) or '—'}<br>"
+            f"<b>Shared:</b> {esc(', '.join(di['shared'])) or '—'}<br>"
             f"<b>Ignition shift:</b> {di['ignition_shift']}")
 
     # -- Report tab --------------------------------------------------------- #
     def _build_report_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        self.report_body = QTextEdit(); self.report_body.setReadOnly(True)
-        lay.addWidget(self.report_body); return w
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.report_body = QTextEdit()
+        self.report_body.setReadOnly(True)
+        lay.addWidget(self.report_body)
+        return w
 
     def _render_report(self, b):
         seal = "🔒 sealed" if b.get("sealed") else "⚠ not sealed"
+        voice = (f"written by {esc(b['voice'])}" if b.get("voice")
+                 else "no spokesperson — deterministic text")
         self.report_body.setHtml(
-            f"<h2>Report — {b['model']['display_name']} · {seal}</h2>"
+            f"<h2>Report — {esc(b['model']['display_name'])} · {seal}</h2>"
+            f"<p style='color:#888'>{voice}</p>"
             f"<h3>What happened (plain language)</h3>"
-            f"<p>{b.get('narodski_report','').replace(chr(10), '<br>')}</p>"
-            f"<h3>Expert note</h3><p style='color:#555'>{b.get('expert_note','')}</p>")
+            f"<p>{esc(b.get('narodski_report', '')).replace(chr(10), '<br>')}</p>"
+            f"<h3>Expert note</h3><p style='color:#555'>{esc(b.get('expert_note', '')).replace(chr(10), '<br>')}</p>")

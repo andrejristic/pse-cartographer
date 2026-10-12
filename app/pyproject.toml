@@ -1,25 +1,29 @@
 [project]
 name = "pse-cartographer"
-version = "0.1.0"
-description = "PSE Cartographer — live J-space cartography of a local GGUF patient, on the PSE-A engine"
+version = "0.2.0"
+description = "PSE Cartographer — live J-space cartography of a local GGUF model, on the PSE-A engine (numpy runtime, no PyTorch)"
 authors = [{ name = "Andrej Ristic", email = "andrej.s.ristic@gmail.com" }]
+license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
-
 dependencies = [
     "numpy>=1.24",
-    "gguf>=0.9",
-    "PySide6>=6.5",
+    "scipy>=1.10",
+    "tokenizers>=0.19",
+    "jinja2>=3.1",
+    "PySide6-Essentials>=6.5",
     "matplotlib>=3.7",
-    "anthropic>=0.40",   # Claude spokesperson
-    "openai>=1.40",      # Gemini / Mistral / Groq spokespersons (OpenAI-compatible)
+    "anthropic>=1.0",      # Claude spokesperson (official SDK); other providers use plain HTTPS
 ]
-
-[project.optional-dependencies]
-# dissection of the patient (L2-L4 / cartography); a CUDA GPU helps L4 a lot
-dissect = ["torch>=2.1", "transformers>=4.44", "accelerate>=0.30", "sentencepiece", "protobuf"]
 
 [project.scripts]
 pse-cartographer = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = { find = { include = ["cartographer*", "pse_a*"] } }
+
+[tool.setuptools.package-data]
+pse_a = ["data/*.txt", "core/lens/*.txt", "tests/fixtures/*.gguf"]
 
 [build-system]
 requires = ["setuptools>=68"]
