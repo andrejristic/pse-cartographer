@@ -97,6 +97,8 @@ class LLMError(Exception):
 # ------------------------------------------------------------------ podesavanja
 def config_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or ""
+    if not base and os.name == "nt":
+        return Path(os.environ.get("APPDATA") or Path.home()) / "PSE Cartographer" / "llm.json"
     if not base or "/snap/" in base:
         base = str(Path.home() / ".config")
     return Path(base) / APP_DIR / "llm.json"
@@ -107,7 +109,7 @@ def load_config() -> dict:
     if not p.exists():
         return {"active": None, "providers": {}, "dismissed": False}
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except ValueError:
         return {"active": None, "providers": {}, "dismissed": False}
 
@@ -120,7 +122,7 @@ def save_config(cfg: dict) -> None:
                                     for k, v in cfg.get("providers", {}).items()}}
     tmp = p.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=1)
     os.replace(tmp, p)
     os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)

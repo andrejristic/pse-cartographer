@@ -172,7 +172,7 @@ def depth_map(per_layer: dict[int, dict]) -> dict:
 def load_ambiguous() -> list[str]:
     from pathlib import Path
     p = Path(__file__).with_name("prompts_ambiguous.txt")
-    return [ln.strip() for ln in p.read_text().splitlines()
+    return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.startswith("#")]
 
 

@@ -210,7 +210,7 @@ class CartographerWindow(QMainWindow):
 
     def remember_path(self, mh, path, name, mm):
         try:
-            d = json.loads(self._paths_file().read_text())
+            d = json.loads(self._paths_file().read_text(encoding="utf-8"))
         except Exception:
             d = {}
         d[mh] = path
@@ -220,7 +220,7 @@ class CartographerWindow(QMainWindow):
 
     def path_of(self, mh):
         try:
-            return json.loads(self._paths_file().read_text()).get(mh)
+            return json.loads(self._paths_file().read_text(encoding="utf-8")).get(mh)
         except Exception:
             return None
 

@@ -28,7 +28,7 @@ def _module_targets(tree: ast.AST, pkg_depth: int) -> list[str]:
 def check_core_purity() -> list[str]:
     bad = []
     for py in (ROOT / "core").rglob("*.py"):
-        tree = ast.parse(py.read_text(), filename=str(py))
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for tgt in _module_targets(tree, 0):
             norm = tgt.lstrip(".")
             head = norm.split(".")[0]

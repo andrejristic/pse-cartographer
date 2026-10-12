@@ -111,11 +111,12 @@ class HarvestStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, p)                                   # atomicno na istom fs
-        fd = os.open(p.parent, os.O_RDONLY)                  # ovaj svi zaborave
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        if os.name != "nt":                     # Windows ne otvara direktorijume
+            fd = os.open(p.parent, os.O_RDONLY)                  # ovaj svi zaborave
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         self.db.execute("INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?)",
                         (layer, cid, int(a16.shape[0]), str(p), crc, time.time()))
         self.db.commit()                                     # TEK SADA je "gotovo"

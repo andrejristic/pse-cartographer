@@ -47,7 +47,7 @@ def selftest() -> int:
     # GUI smoke test without a display: build the window over a temporary data folder
     import tempfile
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         os.environ["PSE_CARTOGRAPHER_DATA"] = d
         os.environ["XDG_CONFIG_HOME"] = d
         try:

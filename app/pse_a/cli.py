@@ -101,11 +101,11 @@ def main(argv=None) -> int:
             from .shell.sae_mission import run_sae
             from .profiles import PROFILES
             prof = PROFILES[a.profile] if a.profile else select_profile(probe(benchmark=True))
-            text = Path(a.corpus).read_text(errors="ignore") if a.corpus else None
+            text = Path(a.corpus).read_text(encoding="utf-8", errors="ignore") if a.corpus else None
             r = run_sae(a.model, lib, a.layer, prof, text, a.corpus or "built-in corpus")
         elif a.cmd == "ppl":
             from .shell.ppl_mission import run_ppl_ladder
-            text = Path(a.text).read_text(errors="ignore") if a.text else None
+            text = Path(a.text).read_text(encoding="utf-8", errors="ignore") if a.text else None
             r = run_ppl_ladder(a.folder, lib, a.tokens, text, a.text or "built-in corpus")
         else:
             return 1

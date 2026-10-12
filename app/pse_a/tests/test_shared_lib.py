@@ -33,7 +33,7 @@ def run() -> bool:
     good &= ok
     print(f"     mean delta {dm:.2e}  var delta {dv:.2e}   {OK if ok else PAD}")
 
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         sl = SharedLib(td)
         sl.register_model("m1", "test.gguf", "qwen2", {})
         healthy = [30 + rnd.gauss(0, 1.0) for _ in range(50)]

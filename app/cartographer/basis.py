@@ -97,7 +97,7 @@ class JSpaceBasis:
         rp, mp = d / f"{key}_L{layer}.rows.npy", d / f"{key}_L{layer}.meta.json"
         if not (rp.exists() and mp.exists()):
             return None
-        meta = json.loads(mp.read_text())
+        meta = json.loads(mp.read_text(encoding="utf-8"))
         return cls(layer, np.load(rp), meta["token_ids"], meta["labels"], meta["n_prompts"])
 
 

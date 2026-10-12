@@ -145,6 +145,13 @@ class SharedLib:
             self._tls.conn = c
         return c
 
+    def close(self) -> None:
+        """Zatvori konekciju ove niti (Windows ne da da se otvoren fajl obrise)."""
+        c = getattr(self._tls, "conn", None)
+        if c is not None:
+            c.close()
+            self._tls.conn = None
+
     # ------------------------------------------------------------- artefakti
     def _blob_path(self, h: str) -> Path:
         d = self.root / "artifacts" / h[:2]
@@ -168,11 +175,12 @@ class SharedLib:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, p)
-        fd = os.open(p.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        if os.name != "nt":                     # Windows ne otvara direktorijume
+            fd = os.open(p.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         return h
 
     def get_blob(self, h: str) -> bytes:

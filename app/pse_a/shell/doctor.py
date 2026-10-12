@@ -48,6 +48,9 @@ def data_root() -> str:
     env = os.environ.get("PSE_CARTOGRAPHER_DATA") or os.environ.get("PSE_A_DATA")
     if env:
         return os.path.abspath(os.path.expanduser(env))
+    if os.name == "nt" and not os.environ.get("XDG_DATA_HOME"):
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                            "PSE Cartographer")
     base = os.environ.get("XDG_DATA_HOME") or ""
     if not base or "/snap/" in base or "/.snap" in base or not os.path.isabs(base):
         base = os.path.expanduser("~/.local/share")
@@ -55,13 +58,13 @@ def data_root() -> str:
 
 
 def _cpu() -> tuple[str, int, int, list[str]]:
-    model, flags, physical = "?", [], set()
+    model, flags, physical = (platform.processor() or "?"), [], set()
     logical = os.cpu_count() or 0
     try:
         with open("/proc/cpuinfo") as f:
             cur_phys = cur_core = None
             for line in f:
-                if line.startswith("model name") and model == "?":
+                if line.startswith("model name"):
                     model = line.split(":", 1)[1].strip()
                 elif line.startswith("flags") and not flags:
                     want = {"avx", "avx2", "fma", "avx512f", "sse4_2", "f16c", "bf16"}
@@ -78,14 +81,8 @@ def _cpu() -> tuple[str, int, int, list[str]]:
 
 
 def _ram() -> int:
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return 0
+    from ..core.runtime.numpy_rt import ram_bytes      # /proc/meminfo, ili Windows API
+    return ram_bytes()
 
 
 def _blas_name() -> str:
@@ -120,7 +117,7 @@ def probe(benchmark: bool = True) -> MachineReport:
         r.warnings.append(
             f"OMP_NUM_THREADS={nt or 'not set'}; {r.cores_physical} (physical cores) is "
             f"recommended — hyperthreading hurts GEMM")
-    if not r.has_avx2:
+    if r.flags and not r.has_avx2:                    # bez /proc/cpuinfo flagovi su nepoznati
         r.warnings.append("CPU has no AVX2/FMA — everything works, but expect slower runs")
     return r
 
