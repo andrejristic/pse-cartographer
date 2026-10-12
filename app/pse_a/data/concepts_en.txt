@@ -1,0 +1,33 @@
+# Probe vocabulary for J-space cartography: common English content words across domains.
+# Only words that are a single token in the patient's vocabulary are used.
+water river bank money boat ship sea ocean lake fish bird dog cat horse cow animal tree
+forest flower grass sun moon star sky rain snow wind cloud fire ice stone rock sand mountain
+hill road street city town village house home room door window wall table chair bed kitchen
+food bread meat milk egg apple fruit sugar salt coffee tea wine beer drink dinner lunch
+man woman child boy girl baby mother father brother sister friend king queen doctor teacher
+student police soldier farmer worker family people person name
+head hand eye face heart blood body leg foot hair mouth voice
+red blue green black white yellow gold silver
+hot cold warm cool dry wet big small large little long short high low old new young fast slow
+good bad happy sad angry afraid strong weak rich poor free safe dark light bright clean dirty
+open closed full empty heavy easy hard soft loud quiet true false right wrong
+one two three four five six seven eight nine ten hundred thousand number zero
+add plus minus equal sum total half double
+time day night morning evening week month year hour minute today tomorrow
+school book paper letter word story song music art game sport ball team
+money price market trade business company bank account loan pay buy sell cost
+war peace army battle gun weapon fight attack
+car train plane bus bike wheel engine fuel
+computer phone code program function return data file system network internet
+science math physics chemistry biology energy power force matter atom light heat
+hydrogen oxygen carbon iron metal gold glass oil gas
+god church prayer soul spirit love hate fear hope dream sleep death life
+law court judge crime prison
+country nation state government president party vote
+health disease medicine hospital pain
+language English French German Spanish Chinese Russian
+north south east west left right up down inside outside
+telescope camera picture image color shape circle square line
+walk run jump swim fly drive ride sit stand sleep eat drink read write speak think know
+see look hear feel want need love like give take make go come
+was is be have do say said get find tell ask work call try use

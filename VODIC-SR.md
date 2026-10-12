@@ -1,119 +1,143 @@
 # PSE Cartographer — Vodič (srpski)
 
-Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
+Verzija 0.2.0. Poređano od **najvažnijeg ka manje važnom**. Čitaj koliko ti treba pa stani.
 
 ---
 
 ## 1. Šta je ovo i šta je srce
 
-Uđeš u **lokalni GGUF model (pacijent)**, procijeniš mu **J-space bazu jednom**, pa ga
-**hraniš promptovima i gledaš kako mu se J-space mijenja** — a na kraju dobiješ **narodski
-raport** koji objašnjava šta se desilo, s konkretnim brojevima.
+Otvoriš **lokalni GGUF model (pacijent)**, procijeniš mu **J-space bazu jednom**, pa ga
+**hraniš promptovima i gledaš kako mu se J-space mijenja** — koje pojmove model "drži u glavi",
+spremne za izgovor, na svakom sloju — a na kraju dobiješ **narodski raport** šta se desilo, s
+konkretnim brojevima.
 
 Dvije uloge (ne miješaj):
-- **glasnogovornik (radni model)** — vodi razgovor i piše raport; biraš ga na startu
-  (Claude / Gemini / Mistral / Groq preko ključa, ili lokalni GGUF preko putanje).
-- **pacijent** — **uvijek lokalni GGUF** koji seciramo; njemu mapiramo J-space.
+- **glasnogovornik (radni model)** — razgovara s tobom i piše raporte; biraš ga pri prvom
+  pokretanju (Claude, Gemini, Mistral, Groq i drugi preko ključa; lokalni server kao Ollama; ili
+  lokalni GGUF, bez interneta).
+- **pacijent** — **uvijek lokalni GGUF** koji seciramo; njemu mapiramo J-space. Ne napušta tvoj
+  računar; online glasnogovornik dobija samo sažetke zapečaćenih rezultata.
 
-Cartographer koristi isti motor kao postojeći PSE analizator, pa **unutra možeš i sve što
-je ta app umjela** (spektar, ESD, waterfall, dossier, chat) + novi kartografski tok.
+U istom prozoru je **sve što radi PSE analizator** (spektralna anatomija, poređenje preciznosti,
+waterfall misli, rječnik pojmova, mapa J-prostora, perplexity lestvica, dosije, swarm i inbox),
+plus **Findings & Conclusions**, gdje glasnogovornik razmišlja nad svim tim.
+
+Sve radi na procesoru, s vlastitim numpy motorom — **bez PyTorch-a, bez GPU-a, ništa se ne
+doinstalira**.
 
 ---
 
 ## 2. Prvi ulazak: izbor glasnogovornika
 
-Kad prvi put uđeš, iskoči izbor glasnogovornika. **Izaberi ga** — bez njega vidiš samo sirove
-brojeve i grafove, a **nema**: razgovora, narodskog raporta, kratkih stručnih objašnjenja, ni
-aktivnog kartografa. Možeš i "Odloži" pa podesiti kasnije (**Cartographer → Choose
-spokesperson…**), ali app te gura da izabereš jer tekst je ono što rezultate čini čitljivim.
+Iskoči izbor. **Izaberi ga** — bez njega vidiš brojeve i grafove, ali nema razgovora, narodskog
+raporta, stručnih napomena, Findings & Conclusions ni aktivnog kartografa. Može i "Defer", pa
+kasnije (**Cartographer → Choose spokesperson…**).
+
+- Unesi ključ, **Fetch model list**, izaberi model, **Test**, pa **Use**.
+- Izbor se pamti u `~/.config/pse-cartographer/llm.json` (samo vlasnik). Skini kvačicu "Remember
+  the key" ako ne želiš ključ na disku.
+- **Lokalni GGUF** glasnogovornik je besplatan i offline, ali spor na procesoru; mali modeli (≤1B)
+  pišu slabe raporte. Za raporte se preporučuje ~3B ili online model.
 
 ---
 
 ## 3. Kako doći do srca (mapiranje J-space)
 
-1. Otvori tab **★ Cartographer** → pod-tab **Patient**.
-2. **Daj putanju do lokalnog GGUF-a** (disk ili USB) — dugme *Browse…*.
-3. Ako fali torch, tab to kaže i ponudi **dugme "Install dissection support"** (ili copy-paste
-   komande, vidi §7). Bez torch-a mapiranje ne radi (L0/L1 rade).
-4. Klikni **Analyze patient**. Kad završi, app skoči na **Drift / Diff** — srce:
-   - stubići = koliko se "držani koncepti" pomjere od prompta do prompta (0 = isto, 1 = skroz drugo);
-   - crvena linija = ignicioni sloj po promptu (gdje model naglo odluči);
-   - izaberi dva prompta i **Diff A → B** da vidiš šta se tačno upalilo/ugasilo.
-5. Tab **Report** = narodski raport "šta se desilo" + kratko stručno objašnjenje.
-6. Tab **Session** = po-prompt očitanja (šta model "drži u glavi"). **Basis** = koji su slojevi
-   mapirani.
+1. **★ Cartographer → Patient**: daj putanju do lokalnog GGUF-a (disk ili USB).
+2. Po želji upiši svoje promptove (jedan po redu) i broj riječi-sondi.
+3. **Analyze patient**. Lanac ide sam: spektralna anatomija (jednom po modelu) → J-space baza za
+   **svaki** sloj → očitavanje svakog prompta → drift → raport → pečat. Napredak je u statusnoj
+   traci. Kad završi, app skoči na **Drift / Diff** — srce:
+   - stubići = koliko se držani pojmovi pomjere od prompta do prompta (0 = isto, 1 = skroz drugo);
+   - crvena linija = ignicioni sloj po promptu (gdje se model naglo odluči; −1 = nema);
+   - izaberi dva prompta i **Diff A → B** da vidiš šta se tačno upalilo i ugasilo.
+4. **Session** = šta je model držao u glavi za svaki prompt. **Basis** = mapirani slojevi i
+   riječi-sonde. **Report** = narodski raport + kratka stručna napomena.
+5. Svaki završen run je u biraču na vrhu, pa ga možeš kasnije ponovo otvoriti.
+
+**Aktivni kartograf** (kvačica): glasnogovornik smišlja sljedeći prompt iz prethodnog očitanja —
+radni model vodi mapiranje umjesto fiksne liste.
 
 ---
 
 ## 4. Kako čitati brojeve
 
-- **Drift 0..1** — mala vrijednost: model o sličnim promptovima "misli" slično; velika: naglo
-  drugačije. Skokovi pokazuju gdje se J-space naglo mijenja.
-- **Ignicioni sloj** — gdje entropija naglo padne, tj. model se "odluči". Različiti promptovi
-  mogu paliti na različitim slojevima.
-- **Koncept-čipovi** — vokabularni tokeni koje model drži kao izgovorljive na tom sloju.
-- **Klasteri** — promptovi grupisani po J-space potpisu (slični "načini razmišljanja").
+- **Drift 0..1** — malo: model o uzastopnim promptovima "misli" slično; veliko: nagla promjena.
+- **Ignicioni sloj** — gdje entropija dekompozicije naglo padne, tj. model se odluči.
+- **Čipovi pojmova** — riječi-sonde (jedan token) čiji lens-pravci grade stanje na tom sloju, po
+  težini. Sonde su sadržajne riječi tvojih promptova plus ugrađena lista čestih pojmova.
+- **Udio J-prostora** — koliko je unutrašnjeg stanja u obliku "spremno za izgovor"; par posto je
+  normalno.
+- **Grupe** — promptovi grupisani po tome koje pojmove pale.
 
-> Iskreno: da li mali modeli uopšte imaju čistu strukturu je otvoreno pitanje. Dobijaš prave
-> brojeve, ali interpretacija je istraživačka — raport i piše s nesigurnošću.
-
----
-
-## 5. Aktivni kartograf (opciono)
-
-Na Patient tabu čekiraj **"Active cartographer"**: glasnogovornik sam smišlja sljedeći prompt
-na osnovu prethodnog očitanja — radni model vodi mapiranje pacijenta umjesto fiksne baterije.
+> Iskreno: da li mali modeli uopšte imaju čistu strukturu je otvoreno pitanje. Brojevi su pravi;
+> tumačenje je istraživačko, i raporti to kažu.
 
 ---
 
-## 6. Sve što je stara app umjela — i dalje je tu
+## 5. Findings & Conclusions
 
-Unutar Cartographer-a su svi postojeći tabovi: Model Card + capability semafor, Spectral Map
-(L1), ESD, Waterfall (L2), Features (L3), J-space (L4), Dossier, Swarm, chat. Za L0/L1 ne treba
-ni ključ ni torch — radi offline.
-
----
-
-## 7. Instalacija (na mašini gdje testiraš)
-
-```bash
-cd "~/Desktop/PSE/PSE Cartographer/app"
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt      # GUI + L0/L1 + cloud glasnogovornici
-python main.py
-```
-Za **seciranje pacijenta (J-space)** treba torch (CPU verzija, jer nema grafičke):
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install transformers accelerate sentencepiece protobuf
-```
-Isto ovo radi i dugme na Patient tabu. (Motor `pse_a` se uvozi iz susjednog foldera
-`PSE J-space/app`; ako ga premjestiš, postavi `PSE_ENGINE` na tu putanju.)
+Izaberi model (i po želji drugi za **A vs B**), štikliraj "next steps" ako želiš da
+glasnogovornik predloži sljedeće runove, i klikni **Write findings & conclusions**. Svaki nalaz
+mora navesti oznaku zapečaćenog rezultata iz kog dolazi (npr. `[83edeee8]`); raport koji ništa
+ne citira označen je kao nepouzdan. Raport se pečati kao i svaki drugi rezultat i izvozi u
+**Markdown, HTML, PDF** ili **zip sa svim rezultatima ispod njega**.
 
 ---
 
-## 8. Pravljenje `.deb`
+## 6. Sve ostalo u prozoru
 
-```bash
-cd "~/Desktop/PSE/PSE Cartographer/packaging"
-./build_deb.sh                       # spakuje i Cartographer i motor
-sudo apt install ./pse-cartographer_0.1.0_all.deb
-```
-`.deb` nosi i motor (`pse_a`) i svoj `/opt` venv; launcher sam postavi `PSE_ENGINE`.
+- **Model Card** — anatomija modela, semafor sposobnosti za *ovu* mašinu i procjene vremena;
+  dugmad za svaku analizu (L1, L2, L4, L3, poređenje preciznosti, perplexity lestvica).
+- **Spectral Map** — eksponent α po matrici (2–4 = istrenirano, > 6 = još kao šum); klik na
+  ćeliju daje spektar naspram Marchenko–Pastur ivice.
+- **Precision** — šta je kvantizacija promijenila, po ulozi. **Perplexity** — isti tekst kroz
+  više preciznosti istog modela.
+- **Thought Waterfall** — šta bi model rekao da mora progovoriti na svakom sloju.
+- **Features** — rječnik pojmova (sparse autoencoder) s primjerima gdje se koji pojam pali.
+- **J-space** — profil po dubini: čulni dio / radni prostor / izlaz i ignicioni marker.
+- **Dossier** — svaki zapečaćen run u dva registra (narodski i matematički); bilješke (samo se
+  dodaju — rezultati se nikad ne mijenjaju, ispravka je nov run); poređenje dva modela.
+- **Swarm & Inbox** — jedinice na poslu (prsten budžeta, angažman θ), skorašnji runovi i zašto
+  neki nije primljen, i inbox s odlukama za tebe.
+- **Conversation** (desno) — pitaj glasnogovornika o zapečaćenim rezultatima.
 
 ---
 
-## 9. Ograničenje (nepromijenjeno)
+## 7. Instalacija
 
-Pun J-space na 16GB **bez grafičke** realan je za **male pacijente (~0.5–3B)** u fp32; 7–8B
-traži GPU ili kvantovano učitavanje. L0/L1 rade i na 7–8B. Semafor to javi na Patient tabu.
+- **Linux (.deb)**: `sudo apt install ./pse-cartographer_0.2.0_amd64.deb`, pa *PSE Cartographer*
+  iz menija ili `pse-cartographer`.
+- **Windows (.exe)**: pokreni `PSECartographer-Setup-0.2.0.exe` (ne treba admin).
+- **Iz izvornog koda**: `cd app && ./setup.sh && ./run.sh` (Python 3.10+).
+
+Provjera instalacije bilo kad: `pse-cartographer --selftest` (bez interneta, bez modela).
 
 ---
 
-## 10. Ako zapne
+## 8. Podržani modeli i ograničenja
 
-- **"Analysis unavailable"** → nema torch/transformers → instaliraj (§7) ili dugmetom.
-- **Glasnogovornik ćuti / nema raporta** → nisi izabrao glasnogovornika ili fali ključ/putanja.
-- **Model se ne otvara / čudna imena tenzora** → familija možda nije u mapi imena motora
-  (`pse_a/core/naming.py`) ili je transformers ne učitava iz GGUF-a; probaj safetensors verziju.
-- **Sporo** → mali model; baza se računa jednom (minute), očitavanja su brza.
+- Arhitekture: **Qwen2 / Qwen2.5, Qwen3, Llama 2 / 3 / 3.x, Mistral** (i ostali koje llama.cpp
+  piše kao `llama`). Ostali se odbiju pri otvaranju fajla, nikad usred rada.
+- Kvantizacije: F32, F16, BF16, Q8_0, Q4_0/Q4_1, Q5_0/Q5_1, Q2_K–Q6_K, IQ4_NL.
+- Mašina: računar od 16 GB bez GPU-a (čak i bez AVX2) udobno mapira modele od **0,5–3B**
+  (minute za 0,5B, ~10 minuta za 1B, duže za 3B). Veći modeli rade i kad ne stanu u RAM —
+  slojevi se tada dekodiraju jedan po jedan, sporije; Model Card to kaže unaprijed.
+
+---
+
+## 9. Kad nešto ne radi
+
+- **"L2–L4 unavailable"** na Model Card-u → arhitektura ili tip kvantizacije još nije podržan;
+  kartica kaže koji.
+- **Nema teksta raporta** → nema glasnogovornika ili mu fali ključ/model (meni Cartographer).
+- **Sporo** → manje riječi-sondi ili manji model; J-space baza se računa jednom i kešira.
+- Podaci (dosije, keširane baze, fajlovi rezultata): `~/.local/share/pse-cartographer`
+  (File → Open data folder).
+
+---
+
+## 10. Licenca
+
+Slobodan softver pod **GNU GPL v3 ili novijom**; vidi `LICENSE` i uslov o autorstvu u `NOTICE`.
+© 2026 Andrej Ristic / Zerava Technologies Inc.

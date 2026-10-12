@@ -24,3 +24,14 @@ audit/
 keys.json
 secrets.json
 .env
+
+# local dev only (test oracle venv, real test models) — see .dev/CLEANUP.md
+.dev/*
+*.gguf
+!app/pse_a/tests/fixtures/*.gguf
+app/.venv/
+app/build/
+app/packaging/stage/
+app/packaging/stage-win/
+dist/
+*.desktop
